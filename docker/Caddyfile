@@ -1,0 +1,6 @@
+# Single public port → Node app service (Compose network).
+# Map host HISAB_PORT (default 8080) → container :8080 only.
+:8080 {
+	encode gzip zstd
+	reverse_proxy app:8787
+}

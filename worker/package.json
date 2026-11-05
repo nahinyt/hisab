@@ -1,9 +1,14 @@
 {
-  "name": "ecomdrive-stock",
+  "name": "hisab-worker",
   "private": true,
   "type": "module",
-  "scripts": {
-    "sync": "node ecomdrive.mjs"
+  "engines": {
+    "node": ">=20"
   },
-  "dependencies": {}
+  "scripts": {
+    "start": "node server.mjs",
+    "check": "node --check server.mjs && node --check auth.mjs && node --check ecomdrive.mjs && node --check steadfast.mjs && node --check pathao.mjs && node --check smoke.mjs",
+    "test": "node smoke.mjs",
+    "sync": "node ecomdrive.mjs"
+  }
 }

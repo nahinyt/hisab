@@ -20,8 +20,14 @@ if (fs.existsSync(envPath)) {
     if (!process.env[k]) process.env[k] = v;
   }
 }
-const smsPath = path.join(workerDir, 'sms-balances.json');
+const dataDir = process.env.HISAB_DATA_DIR || workerDir;
+if (dataDir !== workerDir) fs.mkdirSync(dataDir, { recursive: true });
+const smsPath = process.env.HISAB_SMS_FILE || path.join(dataDir, 'sms-balances.json');
+if (process.env.HISAB_DATA_DIR && !process.env.HISAB_AUTH_FILE) {
+  process.env.HISAB_AUTH_FILE = path.join(dataDir, 'auth.json');
+}
 const PORT = Number(process.env.PORT || 8787);
+const TRUST_PROXY = process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true';
 const FILES = new Map([
   ['/', 'index.html'],
   ['/index.html', 'index.html'],
@@ -130,12 +136,19 @@ function readCookie(req, name) {
 }
 
 function sessionCookie(token, maxAge) {
-  return `hisab_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
+  const secure = String(process.env.PUBLIC_ORIGIN || '').startsWith('https:') ? '; Secure' : '';
+  return `hisab_session=${encodeURIComponent(token)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`;
 }
 
 function clientIp(req) {
-  const ip = req.socket.remoteAddress || '';
-  return ip.startsWith('::ffff:') ? ip.slice(7) : ip;
+  let ip = req.socket.remoteAddress || '';
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  // Local reverse proxy, or Docker Caddy (TRUST_PROXY=1): use the real client.
+  if (TRUST_PROXY || ip === '127.0.0.1' || ip === '::1') {
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    if (xff) return xff.replace(/^::ffff:/, '');
+  }
+  return ip;
 }
 
 function loopback(req) {
@@ -190,7 +203,8 @@ const server = http.createServer(async (req, res) => {
         const password = String(body.password || '');
         const email = String(body.email || '');
         if (url.pathname === '/api/setup') {
-          if (!loopback(req)) {
+          // First-time only (createPassword rejects if already set). Needed behind Docker/Caddy.
+          if (hasPassword() && !loopback(req)) {
             send(res, 403, JSON.stringify({ error: 'Setup is only allowed on this computer' }), 'application/json; charset=utf-8', origin);
             return;
           }

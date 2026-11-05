@@ -1,0 +1,5 @@
+# Single public HTTP port for local verify (no TLS).
+:8080 {
+	encode gzip zstd
+	reverse_proxy 127.0.0.1:8787
+}

@@ -1,0 +1,22 @@
+# Hisab — one public front door (Caddy) → Node UI+API on loopback :8787
+#
+# Install:  https://caddyserver.com/docs/install  (Arch: pacman -S caddy)
+# Run:     caddy run --config /path/to/hisab/Caddyfile
+# Validate: caddy validate --config Caddyfile
+#
+# Set HISAB_DOMAIN to your hostname, e.g.:
+#   HISAB_DOMAIN=hisab.example.com caddy run --config Caddyfile
+#
+# Production: Caddy binds :443 (HTTPS). :80 is only used to redirect → HTTPS / ACME.
+# Node must stay on HOST=127.0.0.1 PORT=8787 (see worker/.env.example).
+
+{$HISAB_DOMAIN:hisab.localhost} {
+	encode gzip zstd
+	reverse_proxy 127.0.0.1:8787
+}
+
+# Local HTTP-only single port (no TLS). Uncomment and comment out the block above if needed.
+# :8080 {
+# 	encode gzip zstd
+# 	reverse_proxy 127.0.0.1:8787
+# }
