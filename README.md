@@ -23,11 +23,12 @@ Internet ──► Caddy (:8080 published) ──► Node app (:8787, internal o
 
 ```bash
 cp worker/.env.example worker/.env   # set at least HISAB_EMAIL
+cp .env.example .env                 # set PORT to the host port you want published
 docker compose up -d --build
-# site: http://127.0.0.1:8080
+# site: http://127.0.0.1:$PORT
 ```
 
-Only **one** port is mapped (`8080` by default). Change it with `HISAB_PORT=3000 docker compose up -d`.
+Only **one** host port is published (Caddy → app). Set it in project-root `.env` as `PORT=…` (Compose reads that for port mapping). Do not rely on `PORT` inside `worker/.env` for publishing — that file is for app secrets; Compose forces the app to listen on **8787** internally.
 
 Persistent data (`auth.json`, SMS balances) lives in the `hisab-data` volume.
 

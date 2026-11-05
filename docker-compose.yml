@@ -1,10 +1,14 @@
 # Hisab: Node (internal) + Caddy (one published port).
 #
-#   cp worker/.env.example worker/.env   # edit secrets
-#   docker compose up -d --build
-#   open http://127.0.0.1:8080
+# Host publish port comes from project `.env` (Compose interpolation):
+#   PORT=61961
+#   PUBLIC_ORIGIN=http://127.0.0.1:61961
 #
-# Only Caddy is published. Node stays on the Compose network.
+#   cp worker/.env.example worker/.env   # app secrets
+#   echo "PORT=8080" > .env              # host port (or your assigned port)
+#   docker compose up -d --build
+#
+# Only Caddy is published. Node stays on the Compose network at :8787.
 
 services:
   app:
@@ -15,11 +19,11 @@ services:
         required: false
     environment:
       HOST: "0.0.0.0"
+      # Internal listen port (do not publish). Host port is PORT in project .env.
       PORT: "8787"
       TRUST_PROXY: "1"
       HISAB_DATA_DIR: /data
-      # Browser origin through the published Caddy port (override in worker/.env for a real domain)
-      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://127.0.0.1:8080}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-http://127.0.0.1:${PORT:-8080}}
     volumes:
       - hisab-data:/data
     expose:
@@ -33,7 +37,7 @@ services:
     depends_on:
       - app
     ports:
-      - "${HISAB_PORT:-8080}:8080"
+      - "${PORT:-8080}:8080"
     volumes:
       - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
     networks:
