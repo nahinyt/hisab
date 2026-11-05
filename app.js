@@ -95,6 +95,37 @@ const dt = v => {
 
 // ---------- settings ----------
 const cfg = () => ({ ...DEF, ...(S.settings.find(x => x.id === 'main') || {}) });
+/** Persist settings.main to memory + disk (+ cloud when up). Raw A.set loses edits while __cloudDown. */
+async function saveMainSettings(patch, ms = 6000) {
+  const clean = scrub({ ...patch, updatedAt: new Date().toISOString() });
+  let main = S.settings.find(x => x.id === 'main');
+  if (!main) { main = { id: 'main' }; S.settings.push(main); }
+  Object.assign(main, clean);
+  return cloudSet('settings', 'main', clean, ms);
+}
+function mergeSettingsRow(cloud, local) {
+  if (!local) return cloud;
+  if (!cloud) return local;
+  const out = { ...cloud, ...local, id: cloud.id || local.id || 'main' };
+  const ct = Date.parse(cloud.updatedAt || '') || 0;
+  const lt = Date.parse(local.updatedAt || '') || 0;
+  // Newer side wins for user scheduling prefs; always keep the latest lastCalcAt.
+  if (ct > lt) {
+    for (const k of ['base', 'interval', 'times', 'onChange', 'skipUnchanged', 'ownerInNetWorth', 'codOn', 'codPct', 'rates', 'types']) {
+      if (cloud[k] !== undefined) out[k] = cloud[k];
+    }
+  } else {
+    for (const k of ['base', 'interval', 'times', 'onChange', 'skipUnchanged', 'ownerInNetWorth', 'codOn', 'codPct', 'rates', 'types', 'countOff', 'paymentWatch', 'dollarBase', 'dollarReady', 'dollarStart']) {
+      if (local[k] !== undefined) out[k] = local[k];
+    }
+  }
+  const stamps = [cloud.lastCalcAt, local.lastCalcAt].filter(Boolean);
+  if (stamps.length) out.lastCalcAt = stamps.slice().sort((a, b) => (Date.parse(a) || 0) - (Date.parse(b) || 0)).pop();
+  if (cloud.syncErrors) out.syncErrors = cloud.syncErrors;
+  else if (local.syncErrors) out.syncErrors = local.syncErrors;
+  out.updatedAt = ct >= lt ? (cloud.updatedAt || local.updatedAt) : (local.updatedAt || cloud.updatedAt);
+  return out;
+}
 const rate = (cur, c = cfg()) => cur === c.base ? 1 : parseFloat(c.rates?.[cur]);
 let WARN = [];
 const toBase = (m, cur, c = cfg()) => {
@@ -1131,6 +1162,14 @@ function keepLocalRows(col, cloudRows) {
     persistSnapshotMirror(merged);
     return merged;
   }
+  if (col === 'settings') {
+    // Stale Firebase main (interval:5) must not wipe a newer local Save while cloud is down.
+    const localById = new Map(local.filter(r => r?.id).map(r => [r.id, r]));
+    const base = cloudRows.map(c => mergeSettingsRow(c, localById.get(c.id)));
+    const cloudIds = new Set(base.map(r => r.id));
+    const pending = local.filter(r => r?.id && !cloudIds.has(r.id));
+    return pending.length ? base.concat(pending) : base;
+  }
   if (col !== 'items') {
     const cloudIds = new Set(cloudRows.map(r => r.id));
     const cloudEmpty = cloudRows.length === 0;
@@ -1890,7 +1929,10 @@ async function calculateNow(manual) {
           window.__holdSnap = false;
           if (!signedOut) await snapshot('calculate');
           const calcAt = new Date().toISOString();
-          const patch = signedOut ? { syncErrors } : { syncErrors, lastCalcAt: calcAt };
+          // Keep current interval on the calc write so a stale cloud default (5) cannot bounce back.
+          const patch = signedOut
+            ? { syncErrors }
+            : { syncErrors, lastCalcAt: calcAt, interval: Math.max(0, Number(cfg().interval) || 0) };
           let main = S.settings.find(x => x.id === 'main');
           if (!main) { main = { id: 'main' }; S.settings.push(main); }
           Object.assign(main, patch);
@@ -3183,10 +3225,10 @@ const VIEWS = {
   settings() {
     const c = cfg();
     return `<div class="card"><h3>Scheduling &amp; base</h3>
-      <div class="tabs"><span class="muted" style="align-self:center">Refresh every:</span>${[1, 2, 5, 10, 15].map(m => `<button class="${c.interval === m ? 'on' : ''}" data-click="preset" data-m="${m}">${m} min</button>`).join('')}</div>
+      <div class="tabs"><span class="muted" style="align-self:center">Refresh every:</span>${[1, 2, 5, 10, 15].map(m => `<button class="${Number(c.interval) === m ? 'on' : ''}" data-click="preset" data-m="${m}">${m} min</button>`).join('')}</div>
       <form class="form" data-form="settings">
       <label>Base currency<input name="base" value="${esc(c.base)}" size="5"></label>
-      <label>Add sheet row every (minutes, 0 = off)<input name="interval" type="number" min="0" value="${c.interval}"></label>
+      <label>Add sheet row every (minutes, 0 = off)<input name="interval" type="number" min="0" value="${Number(c.interval) || 0}"></label>
       <label>Fixed hisab times (HH:MM, Dhaka, comma separated)<input name="times" value="${esc((c.times || []).join(', '))}"></label>
       <label style="flex-direction:row;align-items:center;color:inherit"><input type="checkbox" name="onChange" ${c.onChange ? 'checked' : ''}> add a row on every change</label>
       <label style="flex-direction:row;align-items:center;color:inherit"><input type="checkbox" name="skipUnchanged" ${c.skipUnchanged ? 'checked' : ''}> skip timed rows when nothing changed</label>
@@ -3493,7 +3535,13 @@ document.addEventListener('click', async e => {
       await postEntry({ type: e0.type, amount: e0.amount, currency: e0.currency, fromId: e0.fromId, toId: e0.toId, note: 'Reversal of ' + id, sign: -1, reverses: id }, !!e0.applied);
       await A.set('ledger', id, { reversed: true });
     }
-    else if (a === 'preset') { const m = parseInt(b.dataset.m, 10); await A.set('settings', 'main', { interval: m }); audit('settings.interval', m + ' min'); toast('Rows will be added every ' + m + ' min'); }
+    else if (a === 'preset') {
+      const m = parseInt(b.dataset.m, 10);
+      await saveMainSettings({ interval: m });
+      audit('settings.interval', m + ' min');
+      toast('Rows will be added every ' + m + ' min');
+      render(true);
+    }
     else if (a === 'selhook') { window.__hid = id; render(true); }
     else if (a === 'togglehook') { const w = S.webhooks.find(x => x.id === id); await A.set('webhooks', id, { active: w.active === false }); audit('webhook.toggle', w.name + ' active=' + (w.active === false)); }
     else if (a === 'delhookmap') { const w = S.webhooks.find(x => x.id === window.__hid), i = parseInt(b.dataset.i, 10); if (w) { await A.set('webhooks', w.id, { mappings: (w.mappings || []).filter((_, j) => j !== i) }); audit('webhook.map.remove', w.name); } }
@@ -3542,13 +3590,23 @@ document.addEventListener('submit', async e => {
       toast('Entry posted');
     } else if (kind === 'settings') {
       const times = (v('times') || '').split(',').map(s => s.trim()).filter(s => /^\d\d:\d\d$/.test(s));
-      await A.set('settings', 'main', { base: (v('base') || 'BDT').toUpperCase(), interval: Math.max(0, parseInt(v('interval'), 10) || 0), times, onChange: !!v('onChange'), skipUnchanged: !!v('skipUnchanged'), ownerInNetWorth: !!v('ownerInNetWorth') });
-      audit('settings.save', 'scheduling/base'); toast('Saved');
+      const interval = Math.max(0, parseInt(v('interval'), 10) || 0);
+      await saveMainSettings({
+        base: (v('base') || 'BDT').toUpperCase(),
+        interval,
+        times,
+        onChange: !!v('onChange'),
+        skipUnchanged: !!v('skipUnchanged'),
+        ownerInNetWorth: !!v('ownerInNetWorth')
+      });
+      audit('settings.save', 'scheduling/base interval=' + interval);
+      toast(window.__cloudDown ? 'Saved on this device (cloud slow)' : 'Saved');
+      render(true);
     } else if (kind === 'cod') {
       const pct = String(v('codPct') || '1').trim().replace('%', '');
       const n = parseFloat(pct);
       if (!Number.isFinite(n) || n < 0 || n > 100) throw new Error('COD percent must be between 0 and 100');
-      await A.set('settings', 'main', { codOn: !!v('codOn'), codPct: String(n) });
+      await saveMainSettings({ codOn: !!v('codOn'), codPct: String(n) });
       audit('settings.cod', v('codOn') ? n + '%' : 'off');
       await snapshot('change');
       toast(v('codOn') ? `COD ${n}% is off the EcomDrive sales and Steadfast In review on the sheet` : 'COD charge is no longer taken off');
@@ -3578,11 +3636,11 @@ document.addEventListener('submit', async e => {
       const rates = { ...(c.rates || {}) };
       for (const k of Object.keys(rates)) { const x = v('r_' + k); if (x && parseFloat(x) > 0) rates[k] = x.trim(); }
       if (v('newCur') && parseFloat(v('newRate')) > 0) rates[v('newCur').trim().toUpperCase()] = v('newRate').trim();
-      await A.set('settings', 'main', { rates }); audit('settings.rates', JSON.stringify(rates)); toast('Saved'); scheduleSnap();
+      await saveMainSettings({ rates }); audit('settings.rates', JSON.stringify(rates)); toast('Saved'); scheduleSnap(); render(true);
     } else if (kind === 'types') {
       const types = JSON.parse(JSON.stringify(c.types));
       for (const k of Object.keys(types)) { types[k].cash = v(k + '__cash'); types[k].fin = !!v(k + '__fin'); types[k].profit = v(k + '__profit'); }
-      await A.set('settings', 'main', { types }); audit('rules.save', 'transaction type rules'); toast('Rules saved');
+      await saveMainSettings({ types }); audit('rules.save', 'transaction type rules'); toast('Rules saved'); render(true);
     } else if (kind === 'capital') {
       const amt = toMinor(v('amount'));
       if (!amt || amt <= 0) throw new Error('Enter a positive amount');
@@ -3635,7 +3693,7 @@ document.addEventListener('submit', async e => {
         if (cycle && from.paymentId) {
           const paymentWatch = { ...(cfg().paymentWatch || {}) };
           paymentWatch[cycle.key] = { id: from.paymentId, state: from.paymentState || (cycle.role === 'paid' ? 'paid' : 'unpaid'), dismissedId: from.paymentId, dismissedState: from.paymentState || (cycle.role === 'paid' ? 'paid' : 'unpaid') };
-          await A.set('settings', 'main', { paymentWatch });
+          await saveMainSettings({ paymentWatch });
           await A.set('items', from.id, { include: false });
         }
         toast('Settlement of ' + fmt(amt, to.currency) + ' recorded');
