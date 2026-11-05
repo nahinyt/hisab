@@ -1,0 +1,46 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<title>Hisab</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="style.css?v=calcbar1">
+<style>
+:root{color-scheme:light}
+body{background:var(--bg);color:var(--ink)}
+main{padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+header{padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
+</style>
+<div id="login" class="login hidden">
+  <form id="loginForm" class="card">
+    <h2>Hisab</h2>
+    <p class="muted" id="loginHint">Sign in with your Firebase account</p>
+    <input type="email" id="email" placeholder="Email" autocomplete="off">
+    <input type="password" id="password" placeholder="Password" required autocomplete="current-password">
+    <input type="password" id="password2" class="hidden" placeholder="Confirm password" autocomplete="new-password">
+    <button class="btn primary" id="loginBtn">Sign in</button>
+    <p class="err" id="loginErr"></p>
+  </form>
+</div>
+<div id="app" class="app hidden">
+  <aside id="nav"></aside>
+  <div class="content">
+    <header>
+      <div class="hdr-main">
+        <div><strong id="pageTitle"></strong><span id="demoBadge" class="badge hidden">DEMO MODE</span></div>
+        <div class="hdr-stats" id="hdrStats"></div>
+        <div class="hdr-right">
+          <span id="clock" class="muted"></span>
+          <span id="syncState" class="muted"></span>
+          <button class="btn" data-click="calculateNow">Calculate now</button>
+          <button class="btn ghost" data-click="logout" id="logoutBtn">Sign out</button>
+        </div>
+      </div>
+      <nav class="nav-groups" id="navGroups" aria-label="Pages"></nav>
+    </header>
+    <main id="main"></main>
+  </div>
+</div>
+<div id="modal" class="modal hidden"><div class="modal-box"><button class="x" data-click="closeModal">×</button><div id="modalBody"></div></div></div>
+<div id="calcProgress" class="calc-progress hidden" aria-live="polite"></div>
+<div id="toast" class="toast hidden"></div>
+<script type="module" src="app.js?v=lastPaid2"></script>
+
+</body></html>

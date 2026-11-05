@@ -1,0 +1,12 @@
+# Secrets & local runtime (never commit)
+worker/.env
+worker/auth.json
+worker/.steadfast-session.json
+worker/sms-balances.json
+worker/session/
+worker/out/
+worker/node_modules/
+node_modules/
+.DS_Store
+Thumbs.db
+*.log

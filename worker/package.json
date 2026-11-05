@@ -1,0 +1,9 @@
+{
+  "name": "ecomdrive-stock",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sync": "node ecomdrive.mjs"
+  },
+  "dependencies": {}
+}
