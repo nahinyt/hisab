@@ -14,3 +14,5 @@ README.md
 Caddyfile
 Caddyfile.local
 agent-transcripts
+**/_probe-*
+**/_ecom_js

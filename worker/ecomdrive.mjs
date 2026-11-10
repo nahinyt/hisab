@@ -35,11 +35,7 @@ function money(n) {
   return (Math.round(Number(n) * 100) / 100).toFixed(2);
 }
 
-function trpcInput(json, meta) {
-  return encodeURIComponent(JSON.stringify({ 0: { json, ...(meta ? { meta } : {}) } }));
-}
-
-const clerkState = { jar: new Map(), sessionId: '', jwt: '', exp: 0 };
+const clerkState = { jar: new Map(), sessionId: '', jwt: '', exp: 0, businessId: '' };
 let signingIn = null;
 
 function readExp(jwt) {
@@ -102,6 +98,7 @@ async function passwordLogin() {
   clerkState.sessionId = '';
   clerkState.jwt = '';
   clerkState.exp = 0;
+  clerkState.businessId = '';
   await clerkCall('/v1/client');
   const started = await clerkCall('/v1/client/sign_ins', { identifier: EMAIL });
   const signInId = started?.response?.id;
@@ -149,59 +146,85 @@ async function getJwt() {
   return signingIn;
 }
 
-async function ecom(procedure, json, meta) {
-  try {
-    return await trpc(await getJwt(), procedure, json, meta);
-  } catch (err) {
-    if (err.message !== 'AUTH') throw err;
-    clerkState.jwt = '';
-    clerkState.exp = 0;
-    return await trpc(await getJwt(), procedure, json, meta);
-  }
+function authHeaders(jwt) {
+  return {
+    authorization: 'Bearer ' + jwt,
+    origin: BASE,
+    accept: 'application/json',
+    ...(clerkState.jar.size ? { cookie: [...clerkState.jar].map(([k, v]) => `${k}=${v}`).join('; ') } : {})
+  };
 }
 
-async function trpc(jwt, procedure, json, meta) {
-  const url = `${BASE}/api/trpc/${procedure}?batch=1&input=${trpcInput(json, meta)}`;
-  const res = await fetch(url, { headers: { authorization: `Bearer ${jwt}`, origin: BASE } });
-  const body = await res.json().catch(() => null);
-  if (res.status === 401 || res.status === 403) throw new Error('AUTH');
-  if (!res.ok) throw new Error(procedure + ' HTTP ' + res.status);
-  const err = body?.[0]?.error;
-  if (err) throw new Error(err?.json?.message || err?.message || procedure + ' failed');
-  return body?.[0]?.result?.data?.json;
+async function ensureBusinessId(jwt) {
+  if (clerkState.businessId) return clerkState.businessId;
+  const res = await fetch(BASE + '/api/app/v1/me/businesses', { headers: authHeaders(jwt) });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(json?.error?.message || ('businesses HTTP ' + res.status));
+  const item = (json.items || []).find(b => b.isDefault) || (json.items || [])[0];
+  if (!item?.id) throw new Error('EcomDrive business not found');
+  clerkState.businessId = item.id;
+  return clerkState.businessId;
+}
+
+/** EcomDrive retired Node tRPC; shop data is now Go REST under /api/app/v1/businesses/{id}/… */
+async function api(pathname, query) {
+  const jwt = await getJwt();
+  const businessId = await ensureBusinessId(jwt);
+  const qs = query && Object.keys(query).length
+    ? '?' + new URLSearchParams(Object.entries(query).filter(([, v]) => v != null && v !== '')).toString()
+    : '';
+  const url = `${BASE}/api/app/v1/businesses/${businessId}${pathname}${qs}`;
+  let res = await fetch(url, { headers: authHeaders(jwt) });
+  if (res.status === 401 || res.status === 403) {
+    clerkState.jwt = '';
+    clerkState.exp = 0;
+    clerkState.businessId = '';
+    const jwt2 = await getJwt();
+    const businessId2 = await ensureBusinessId(jwt2);
+    res = await fetch(`${BASE}/api/app/v1/businesses/${businessId2}${pathname}${qs}`, { headers: authHeaders(jwt2) });
+  }
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(json?.error?.message || (pathname + ' HTTP ' + res.status));
+  }
+  return json;
+}
+
+async function collectCursor(pathname, mapItem, query = {}, maxPages = 40) {
+  const out = [];
+  let cursor = '';
+  for (let page = 0; page < maxPages; page++) {
+    const data = await api(pathname, { ...query, ...(cursor ? { cursor } : {}) }) || {};
+    const rows = data.items || data.rows || [];
+    for (const row of rows) {
+      const mapped = mapItem(row);
+      if (mapped) out.push(mapped);
+    }
+    cursor = data.nextCursor || '';
+    if (!cursor || !rows.length) break;
+  }
+  return out;
 }
 
 async function pull(status) {
   const products = [];
-  let pageIndex = 0;
-  let pageCount = 1;
-  const undefinedMeta = { values: { sortBy: ['undefined'], sortDirection: ['undefined'], tagIds: ['undefined'], untagged: ['undefined'], manageStock: ['undefined'] }, v: 1 };
-  while (pageIndex < pageCount && pageIndex < 200) {
-    const data = await ecom('product.getAllProducts', {
-      pageIndex, pageSize: 100, search: '', collapseStockLinks: true,
-      sortBy: null, sortDirection: null, categoryId: [], brandId: [],
-      status, tagIds: null, untagged: null, manageStock: null
-    }, undefinedMeta) || {};
-    const rows = data.rows || [];
-    pageCount = data.pageCount || 1;
-    for (const p of rows) {
-      products.push({
-        sku: p.sku || '',
-        name: p.name || '',
-        costPrice: p.costPrice,
-        sellingPrice: p.price,
-        stockQty: p.stockQty,
-        comboQty: p.comboStock,
-        active: p.isActive
-      });
-    }
-    if (!rows.length) break;
-    pageIndex += 1;
+  // New Go API rejects legacy status filters; pull the catalog and filter locally.
+  const rows = await collectCursor('/products', p => p, {}, 80);
+  for (const p of rows) {
+    const active = p.isActive !== false && p.active !== false;
+    if (status === 'active' && !active) continue;
+    if (status === 'inactive' && active) continue;
+    products.push({
+      sku: p.businessSku || p.sku || '',
+      name: p.name || '',
+      costPrice: p.costPrice ?? p.avgCostPrice,
+      sellingPrice: p.price ?? p.sellingPrice,
+      stockQty: p.stockQty ?? p.stock,
+      comboQty: p.comboStock ?? p.comboQty,
+      active
+    });
   }
-  const stats = await ecom('product.getProductStats', {
-    search: '', collapseStockLinks: true, categoryId: [], brandId: [],
-    status, tagIds: null, untagged: null, manageStock: null
-  }, { values: { tagIds: ['undefined'], untagged: ['undefined'], manageStock: ['undefined'] }, v: 1 }) || {};
+  const stats = await api('/products/stats') || {};
   return { products, stats };
 }
 
@@ -244,41 +267,47 @@ export function checkCourierHistory() {
 
 const META_ADS_CATEGORY = 'cmed57p6oe4aonv0kuq2oinhx';
 const DOLLAR_START = '2026-10-25';
-function dhakaStart(day) {
-  const [y, m, d] = day.split('-').map(Number);
-  return new Date(Date.UTC(y, m - 1, d) - 6 * 60 * 60 * 1000);
+
+function dkDay(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Dhaka' }).format(d);
 }
+
+async function expenseMatrixPages(query = {}, maxPages = 60) {
+  const columns = [];
+  const dayRows = [];
+  let cursor = '';
+  for (let page = 0; page < maxPages; page++) {
+    const data = await api('/finance/expense-matrix', { ...query, ...(cursor ? { cursor } : {}) }) || {};
+    if (page === 0 && Array.isArray(data.columns)) columns.push(...data.columns);
+    const days = data.days?.items || data.days || data.rows || [];
+    const list = Array.isArray(days) ? days : [];
+    for (const row of list) dayRows.push(row);
+    cursor = data.days?.nextCursor || data.nextCursor || '';
+    if (!cursor || !list.length) break;
+  }
+  return { columns, dayRows };
+}
+
 async function runDollar() {
   console.log('checking EcomDrive dollar expenses');
   const today = dkDay(new Date().toISOString());
-  const start = dhakaStart(DOLLAR_START);
-  const end = new Date(dhakaStart(today).getTime() + 24 * 60 * 60 * 1000 - 1);
-  const meta = { values: { startDate: ['Date'], endDate: ['Date'], subCategoryIds: ['undefined'] }, v: 1 };
+  const { columns, dayRows } = await expenseMatrixPages({ categoryIds: META_ADS_CATEGORY });
+  const column = columns.find(c => c.id === META_ADS_CATEGORY);
+  const label = column?.label || 'Meta Ads';
   const byDay = new Map();
-  let label = 'Meta Ads';
-  let rate = '128';
-  let page = 0;
-  let pageCount = 1;
-  while (page < pageCount && page < 30) {
-    const data = await ecom('incomeExpense.getExpenseMatrix', {
-      startDate: start.toISOString(),
-      endDate: end.toISOString(),
-      categoryIds: [META_ADS_CATEGORY],
-      subCategoryIds: null,
-      page,
-      sortKey: 'date',
-      sortDir: 'desc'
-    }, meta) || {};
-    pageCount = Number(data.pageCount) || 1;
-    const column = (data.columns || []).find(c => c.id === META_ADS_CATEGORY);
-    if (column?.label) label = column.label;
-    for (const row of data.rows || []) {
-      if (!row.day || row.day < DOLLAR_START || row.day > today) continue;
-      const cellRate = row.cells?.[META_ADS_CATEGORY]?.find(c => c.usdRate)?.usdRate;
-      if (cellRate) rate = String(cellRate);
-      byDay.set(row.day, { date: row.day, usd: money(row.usdTotal || 0), bdt: money(row.total || 0) });
-    }
-    page += 1;
+  for (const row of dayRows) {
+    const date = row.date || row.day || '';
+    if (!date || date < DOLLAR_START || date > today) continue;
+    const cells = Array.isArray(row.cells) ? row.cells : [];
+    const cell = cells.find(c => c.categoryId === META_ADS_CATEGORY) || cells[0];
+    byDay.set(date, {
+      date,
+      usd: money(cell?.usd ?? row.usd ?? row.usdTotal ?? 0),
+      bdt: money(cell?.amount ?? row.total ?? row.amount ?? 0)
+    });
   }
   const days = [...byDay.values()].sort((a, b) => a.date.localeCompare(b.date));
   const spent = days.reduce((s, d) => s + Number(d.usd || 0), 0);
@@ -289,44 +318,31 @@ async function runDollar() {
     categoryId: META_ADS_CATEGORY,
     start: DOLLAR_START,
     today,
-    rate,
+    rate: '128',
     spent: money(spent),
     todayUsd: todayRow?.usd || '0.00',
     days,
     pulledAt: new Date().toISOString()
   };
 }
+
 async function runExpenses() {
   console.log('checking EcomDrive expenses');
   const today = dkDay(new Date().toISOString());
-  const start = dhakaStart(today);
-  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000 - 1);
-  const meta = { values: { startDate: ['Date'], endDate: ['Date'], subCategoryIds: ['undefined'] }, v: 1 };
+  const { columns, dayRows } = await expenseMatrixPages();
+  const labels = Object.fromEntries((columns || []).map(c => [c.id, c.label || c.id]));
   const sums = {};
-  const labels = {};
-  let page = 0;
-  let pageCount = 1;
-  while (page < pageCount && page < 10) {
-    const data = await ecom('incomeExpense.getExpenseMatrix', {
-      startDate: start.toISOString(),
-      endDate: end.toISOString(),
-      categoryIds: [],
-      subCategoryIds: null,
-      page,
-      sortKey: 'date',
-      sortDir: 'desc'
-    }, meta) || {};
-    pageCount = Number(data.pageCount) || 1;
-    for (const col of data.columns || []) labels[col.id] = col.label || col.id;
-    for (const row of data.rows || []) {
-      if (row.day !== today) continue;
-      for (const [id, cells] of Object.entries(row.cells || {})) {
-        const amount = (Array.isArray(cells) ? cells : []).reduce((s, c) => s + Number(c.amount || 0), 0);
-        sums[id] = (sums[id] || 0) + amount;
-      }
+  for (const row of dayRows) {
+    const date = row.date || row.day || '';
+    if (date !== today) continue;
+    const cells = Array.isArray(row.cells) ? row.cells : [];
+    for (const cell of cells) {
+      const id = cell.categoryId;
+      if (!id) continue;
+      sums[id] = (sums[id] || 0) + Number(cell.amount || 0);
     }
-    page += 1;
   }
+  // If today has no day rows yet, fall back to column totals only for zero-safe UI.
   let metaTotal = 0;
   const categories = [];
   for (const [id, label] of Object.entries(labels)) {
@@ -361,63 +377,42 @@ export function checkDollar() {
   return dollarFlight;
 }
 
-function dkDay(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '';
-  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Dhaka' }).format(d);
-}
-
 async function runSuppliers() {
   console.log('checking EcomDrive active suppliers');
-  const list = await ecom('supplier.getSuppliers', { status: 'all' }) || [];
-  const dueRows = await ecom('supplier.getSupplierDueReport', null, { values: ['undefined'], v: 1 }) || [];
-  const dueById = Object.fromEntries((Array.isArray(dueRows) ? dueRows : []).map(r => [r.supplierId, r]));
-  const suppliers = (Array.isArray(list) ? list : [])
-    .filter(s => s.isActive && Number(s.totalDue) > 0)
-    .map(s => ({
+  const suppliers = (await collectCursor('/suppliers', s => {
+    const due = Number(s.summary?.totalDue ?? s.totalDue ?? 0);
+    if (s.isActive === false || !(due > 0)) return null;
+    return {
       id: s.id,
       name: s.name,
-      due: money(s.totalDue),
-      dueDate: dkDay(dueById[s.id]?.oldestDueDate)
-    }))
-    .sort((a, b) => a.name.localeCompare(b.name));
+      due: money(due),
+      dueDate: dkDay(s.summary?.oldestDueDate || s.oldestDueDate || '')
+    };
+  })).sort((a, b) => a.name.localeCompare(b.name));
   return { source: BASE + '/purchase/suppliers', pulledAt: new Date().toISOString(), suppliers };
 }
 
 async function runAccounts() {
   console.log('checking EcomDrive accounts');
-  const accounts = [];
-  let page = 1;
-  let pages = 1;
-  while (page <= pages && page < 20) {
-    const data = await ecom('account.getAccounts', { page, limit: 50, searchTerm: null }, { values: { searchTerm: ['undefined'] }, v: 1 }) || {};
-    const rows = Array.isArray(data.accounts) ? data.accounts : [];
-    pages = Number(data.pages) || 1;
-    for (const a of rows) {
-      if (a.isActive === false || !a.name) continue;
-      accounts.push({ id: a.id, name: a.name, balance: money(a.balance || 0) });
-    }
-    if (!rows.length) break;
-    page += 1;
-  }
-  accounts.sort((a, b) => a.name.localeCompare(b.name));
+  const accounts = (await collectCursor('/payment-accounts', a => {
+    if (a.isActive === false || !a.name) return null;
+    return { id: a.id, name: a.name, balance: money(a.balance || 0) };
+  })).sort((a, b) => a.name.localeCompare(b.name));
   return { source: BASE + '/accounts', pulledAt: new Date().toISOString(), accounts };
 }
 
 async function runReport() {
   console.log('checking EcomDrive report All');
-  const end = new Date().toISOString();
-  const range = {
-    startDate: '2015-12-31T18:00:00.000Z',
-    endDate: end
-  };
-  const meta = { values: { startDate: ['Date'], endDate: ['Date'] }, v: 1 };
-  const data = await ecom('orderManagementReport.getMonthlySalesSummary', range, meta);
-  const sales = await ecom('orderManagementReport.getNetProductSalesSummary', range, meta);
-  const norm = row => String(row?.status || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+  const endDay = dkDay(new Date().toISOString()) || new Date().toISOString().slice(0, 10);
+  const range = { startDate: '2015-12-31', endDate: endDay };
+  const data = await api('/reports/order-management/monthly-sales', range);
+  const sales = await api('/reports/order-management/net-product-sales', range);
+  const norm = row => String(row?.status || row?.statusText || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
   const by = Object.fromEntries((data?.rows || []).map(r => [norm(r), r]));
   const chargeBy = Object.fromEntries((sales?.rows || []).map(r => [norm(r), r]));
+  // New API uses DELIVERED; Hisab sheet still labels the live pipeline as Shipped/Pending/…
+  if (by.delivered && !by.shipped) by.shipped = by.delivered;
+  if (chargeBy.delivered && !chargeBy.shipped) chargeBy.shipped = chargeBy.delivered;
   const amount = row => {
     if (!row) return null;
     const n = row.totalRevenue ?? row.finalAmount ?? row.grossSale ?? row.productAmount;
@@ -434,7 +429,12 @@ async function runReport() {
       delivery: money(charge?.deliveryCharge || 0)
     };
   }
-  return { range: 'all', source: BASE + '/reports/business-reports?report=net-product-sales', pulledAt: end, metrics };
+  return {
+    range: 'all',
+    source: BASE + '/reports/business-reports?report=net-product-sales',
+    pulledAt: new Date().toISOString(),
+    metrics
+  };
 }
 
 let historyCache = { at: 0, data: null };
@@ -445,36 +445,26 @@ function recentSettlement(iso) {
   const age = Date.now() - t;
   return age <= 30 * 24 * 60 * 60 * 1000 && age > -36 * 60 * 60 * 1000;
 }
+
 async function runCourierHistory() {
   if (historyCache.data && Date.now() - historyCache.at < 60 * 1000) return historyCache.data;
   console.log('checking EcomDrive courier settlement history');
   const invoices = [];
-  let page = 1;
-  let total = Infinity;
-  while (page <= 20) {
-    const data = await ecom('finance.getCourierPaymentInvoices', {
-      page, limit: 50, courierType: null, dateRange: null, preserveTime: false
-    }, { values: { courierType: ['undefined'], dateRange: ['undefined'] }, v: 1 }) || {};
-    const rows = data.invoices || [];
-    total = Number(data.totalCount) || rows.length;
-    for (const row of rows) {
-      const rawId = String(row.courierInvoiceId || '').trim();
-      // UI label is often "Statement SFC-…"; Steadfast payment id is plain "SFC-…".
-      const id = rawId.replace(/^Statement\s+/i, '').trim() || rawId;
-      const when = row.paymentDate || row.settledAt || row.updatedAt || '';
-      if (!id || !recentSettlement(when)) continue;
-      invoices.push({
-        id,
-        rawId,
-        courier: String(row.deliveryMethodType || ''),
-        status: String(row.status || ''),
-        deposited: money(row.depositedAmount),
-        collected: money(row.totalAmount),
-        paidOn: when ? String(when).slice(0, 10) : ''
-      });
-    }
-    if (!rows.length || page * 50 >= total) break;
-    page += 1;
+  const rows = await collectCursor('/finance/courier-invoices', r => r, {}, 30);
+  for (const row of rows) {
+    const rawId = String(row.courierInvoiceId || '').trim();
+    const id = rawId.replace(/^Statement\s+/i, '').trim() || rawId;
+    const when = row.paymentAt || row.paymentDate || row.settledAt || row.updatedAt || '';
+    if (!id || !recentSettlement(when)) continue;
+    invoices.push({
+      id,
+      rawId,
+      courier: String(row.deliveryMethodType || row.deliveryMethodName || ''),
+      status: String(row.status || ''),
+      deposited: money(row.depositedAmount),
+      collected: money(row.totalAmount),
+      paidOn: when ? String(when).slice(0, 10) : ''
+    });
   }
   const payload = {
     source: BASE + '/courier-report?tab=history',
