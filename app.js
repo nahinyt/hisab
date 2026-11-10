@@ -462,31 +462,8 @@ async function tick() {
   try {
     try { await withTimeout(migrate(), 25000, 'migrate timed out'); }
     catch (e) { console.warn(e); }
-    const c = cfg(), now = new Date(), last = latestSnap();
-    const lastMs = Math.max(lastSnapTs, last ? new Date(last.ts).getTime() : 0);
-    const lastDate = lastMs ? dkDate(new Date(lastMs)) : null;
-    const hm = hhmm(now);
-    // Prefer in-memory lastCalcAt; fall back to localStorage mirror if S is stale
-    let lastCalc = c.lastCalcAt ? new Date(c.lastCalcAt).getTime() : 0;
-    if (!lastCalc) {
-      try {
-        const m = (JSON.parse(localStorage.getItem('hisab_settings') || '[]').find(r => r.id === 'main') || {}).lastCalcAt;
-        if (m) lastCalc = new Date(m).getTime() || 0;
-      } catch { /* ignore */ }
-    }
-    const every = Math.max(0, Number(c.interval) || 0);
-    const calcDue = every > 0 && !window.__calcBusy && Date.now() - lastCalc >= every * 60000;
-    if (calcDue) {
-      await calculateNow(false);
-    } else if (lastMs && !window.__calcBusy) {
-      if (lastDate && lastDate !== dkDate(now)) await snapshot('day-open');
-      else if (c.times?.includes(hm) && !S.snapshots.some(s => s.source === 'sched-' + hm && s.date === dkDate(now))) await snapshot('sched-' + hm);
-      await applySmsBalances(false);
-      if (!window.__dollarAt || Date.now() - window.__dollarAt >= 60000) {
-        window.__dollarAt = Date.now();
-        await applyDollar(false);
-      }
-    }
+    // Auto-calculate runs on the production server (worker scheduler), not in this browser.
+    // Live Sheet / balances come from Firestore onSnapshot on every device.
   } catch (e) { console.error(e); }
   finally { ticking = false; window.__tickStartedAt = 0; }
   $('#clock').textContent = dt(new Date());
@@ -1147,18 +1124,22 @@ function collapseDupOpenSnaps(rows) {
   return list.filter(s => !drop.has(s.id));
 }
 function keepLocalRows(col, cloudRows) {
-  // S is empty on first onSnapshot; without the localStorage mirror, a sparse/empty
-  // Firestore reply looks like a full wipe even though hisab_* still has the shop books.
+  // Shared source of truth = Firestore. localStorage is only a short offline cache.
   let local = mergeMemAndMirror(col);
-  if (col === 'snapshots' && (window.__purgeSnapshots || sheetPurgedAt())) {
-    // After Clear Live Sheet: only keep rows created at/after the purge (fresh start).
-    // Union cloud + post-purge local so an empty mid-flight snapshot cannot drop the new open row.
-    const cut = sheetPurgedAt() || Date.now();
-    local = local.filter(r => snapAfterPurge(r, cut));
-    cloudRows = cloudRows.filter(r => snapAfterPurge(r, cut));
-    const cloudIds = new Set(cloudRows.map(r => r.id));
-    const pending = local.filter(r => r?.id && !cloudIds.has(r.id));
-    const merged = collapseDupOpenSnaps(pending.length ? cloudRows.concat(pending) : cloudRows.slice());
+  if (col === 'snapshots') {
+    if (window.__purgeSnapshots || sheetPurgedAt()) {
+      const cut = sheetPurgedAt() || Date.now();
+      local = local.filter(r => snapAfterPurge(r, cut));
+      cloudRows = cloudRows.filter(r => snapAfterPurge(r, cut));
+    }
+    // Any real cloud rows win — do not resurrect another browser's private l* history.
+    if (cloudRows.length) {
+      const merged = collapseDupOpenSnaps(cloudRows.slice());
+      persistSnapshotMirror(merged);
+      return merged;
+    }
+    const pending = local.filter(r => r?.id);
+    const merged = collapseDupOpenSnaps(pending);
     persistSnapshotMirror(merged);
     return merged;
   }
@@ -1171,16 +1152,8 @@ function keepLocalRows(col, cloudRows) {
     return pending.length ? base.concat(pending) : base;
   }
   if (col !== 'items') {
-    const cloudIds = new Set(cloudRows.map(r => r.id));
-    const cloudEmpty = cloudRows.length === 0;
-    const pending = local.filter(r => {
-      if (cloudIds.has(r.id)) return false;
-      if (String(r.id || '').startsWith('l')) return true;
-      // Cloud collection empty/wiped but this browser still has the history — restore it.
-      if (cloudEmpty) return true;
-      return false;
-    });
-    return pending.length ? cloudRows.concat(pending) : cloudRows;
+    if (cloudRows.length) return cloudRows;
+    return local.filter(r => r?.id);
   }
   const localById = new Map(local.filter(r => r?.id).map(r => [r.id, r]));
   // Same id: merge so empty/stale cloud usdt-due cannot erase a local balance.
@@ -1188,9 +1161,9 @@ function keepLocalRows(col, cloudRows) {
   const cloudIds = new Set(base.map(r => r.id));
   const cloudExt = new Set(base.map(r => r.externalId).filter(Boolean));
   const cloudCash = base.filter(r => r.group === 'cash' && !r.archived);
-  const cloudSparse = cloudRows.length <= 2; // e.g. only usdt-due left in Firebase
+  const cloudHealthy = cloudRows.length >= 8; // server/other browser already has the shop books
   const cloudHasUsdt = base.some(r => r.id === USDT_DUE_ID || isUsdtDue(r));
-  // Keep rows Firebase snapshot dropped — but never a second copy of the same cash account / externalId.
+  // Keep only genuine local-only rows — never replay another tab's private l* history over Firestore.
   const pending = local.filter(r => {
     if (cloudIds.has(r.id)) return false;
     if (r.externalId && cloudExt.has(r.externalId)) return false;
@@ -1201,16 +1174,15 @@ function keepLocalRows(col, cloudRows) {
         (key && accountKey(c.name) === key && (!r.externalId || !c.externalId || r.externalId === c.externalId))
       )) return false;
     }
-    // Extra USDT copies (l*) — still keep so collapse can pick the non-zero balance.
-    if (r.id === USDT_DUE_ID || isUsdtDue(r)) return true;
-    if (String(r.id || '').startsWith('l')) return true;
+    if (r.id === USDT_DUE_ID || isUsdtDue(r)) return !cloudHasUsdt;
     if (r.externalId === 'dollar-main' && !cloudExt.has('dollar-main')) return true;
-    if (r.group === 'supplier' && (r.source === 'manual' || !r.externalId)) return true;
+    if (r.group === 'supplier' && (r.source === 'manual' || !r.externalId) && !isUsdtDue(r)) return true;
     if (r.source === 'manual' && !r.externalId) return true;
+    // When cloud is healthy, ignore orphan browser-only clones.
+    if (cloudHealthy) return false;
+    if (String(r.id || '').startsWith('l')) return true;
     if (r.externalId && !cloudExt.has(r.externalId)) return true;
-    // Sparse cloud + non-local ids still on disk (older mirrors / partial uploads)
-    if (cloudSparse) return true;
-    return false;
+    return cloudRows.length === 0;
   });
   let merged = pending.length ? base.concat(pending) : base;
   if (!cloudHasUsdt) {
@@ -1248,7 +1220,7 @@ function keepLocalRows(col, cloudRows) {
   }
   return merged;
 }
-async function cloudSet(col, id, data, ms = 5000) {
+async function cloudSet(col, id, data, ms = 20000) {
   const clean = scrub(data);
   // Always refresh disk mirror so boot hydrate keeps manual balances (USDT DUE, etc.).
   mirrorLocal(col, id, clean);
@@ -1259,9 +1231,10 @@ async function cloudSet(col, id, data, ms = 5000) {
     if (i < 0) rows.push({ id, ...clean });
     else rows[i] = { ...rows[i], ...clean };
   }
-  if (window.__cloudDown) return false;
   try {
     await withTimeout(A.set(col, id, clean), ms, 'Cloud save timed out');
+    window.__cloudDown = false;
+    window.__cloudErr = '';
     return true;
   } catch (err) {
     window.__cloudErr = err.message || 'Cloud save failed';
@@ -1270,19 +1243,20 @@ async function cloudSet(col, id, data, ms = 5000) {
     return false;
   }
 }
-async function cloudAdd(col, data, ms = 5000) {
+async function cloudAdd(col, data, ms = 20000) {
   const clean = scrub(data);
-  if (window.__cloudDown) {
-    const id = localId();
+  try {
+    const id = await withTimeout(A.add(col, clean), ms, 'Cloud save timed out');
+    window.__cloudDown = false;
+    window.__cloudErr = '';
     mirrorLocal(col, id, clean);
     if (Array.isArray(S[col]) && !S[col].some(x => x.id === id)) S[col].push({ id, ...clean });
     return id;
-  }
-  try {
-    return await withTimeout(A.add(col, clean), ms, 'Cloud save timed out');
   } catch (err) {
     window.__cloudErr = err.message || 'Cloud save failed';
     window.__cloudDown = /timed out/i.test(window.__cloudErr);
+    // Do not invent a private l* Live Sheet row — shared sheet must come from Firestore/server.
+    if (col === 'snapshots') return '';
     const id = localId();
     mirrorLocal(col, id, clean);
     if (Array.isArray(S[col]) && !S[col].some(x => x.id === id)) S[col].push({ id, ...clean });
@@ -1878,109 +1852,55 @@ async function calculateNow(manual) {
       return;
     }
   }
-  const jobs = [
-    ['Steadfast', () => checkSteadfast(true), () => window.__sfErr],
-    ['Pathao', () => checkPathao(true), () => window.__ptErr],
-    ['EcomDrive accounts', () => checkEcomdriveAccounts(true), () => window.__acctErr],
-    ['EcomDrive stock', () => checkEcomdriveStock(true), () => window.__stockErr],
-    ['EcomDrive report', () => checkEcomdriveReport(true), () => window.__reportErr],
-    ['EcomDrive suppliers', () => checkEcomdriveSuppliers(true), () => window.__supErr],
-    ['Expenses', () => applyExpenses('quiet'), () => window.__expenseErr],
-    ['Dollar', () => applyDollar('quiet'), () => window.__dollarErr],
-    ['SMS balances', () => applySmsBalances(false).then(() => ''), () => ''],
-    ['Live Sheet', null, () => '']
+  const jobNames = [
+    'Steadfast', 'Pathao', 'EcomDrive accounts', 'EcomDrive stock', 'EcomDrive report',
+    'EcomDrive suppliers', 'Expenses', 'Dollar', 'SMS balances', 'Live Sheet'
   ];
   window.__calcBusy = true;
   window.__calcStartedAt = started;
   window.__holdSnap = true;
   window.__calcShowDone = false;
-  // Drop stale single-check locks left by a previous hung run.
-  window.__sfBusy = false;
-  window.__ptBusy = false;
-  window.__acctBusy = false;
-  window.__stockBusy = false;
-  window.__reportBusy = false;
-  window.__supBusy = false;
-  window.__expenseBusy = false;
-  window.__dollarBusy = false;
-  window.__smsBusy = false;
   window.__cloudDown = false;
   window.__cloudErr = '';
-  window.__calcSteps = jobs.map(([name]) => ({ name, status: 'pending', detail: '' }));
-  window.__calcMsg = 'Checking every source…';
+  window.__calcSteps = jobNames.map(name => ({ name, status: 'pending', detail: '' }));
+  window.__calcMsg = 'Production server is checking every source…';
   const pulse = setInterval(writeLock, 15000);
   paintCalcProgress();
   if (manual) render(true);
   paintCalcProgress();
-  const failed = [];
-  const syncErrors = [];
-  const at = new Date().toISOString();
   try {
-    for (let i = 0; i < jobs.length; i++) {
-      const [name, fn, errOf] = jobs[i];
-      const step = window.__calcSteps[i];
-      step.status = 'run';
-      step.detail = '';
-      window.__calcMsg = 'Checking ' + name + '…';
-      paintCalcProgress();
-      if (name === 'Live Sheet') {
-        try {
-          const signedOut = failed.length > 0 && failed.every(line => line.includes('Sign in required'));
-          window.__holdSnap = false;
-          if (!signedOut) await snapshot('calculate');
-          const calcAt = new Date().toISOString();
-          // Keep current interval on the calc write so a stale cloud default (5) cannot bounce back.
-          const patch = signedOut
-            ? { syncErrors }
-            : { syncErrors, lastCalcAt: calcAt, interval: Math.max(0, Number(cfg().interval) || 0) };
-          let main = S.settings.find(x => x.id === 'main');
-          if (!main) { main = { id: 'main' }; S.settings.push(main); }
-          Object.assign(main, patch);
-          await cloudSet('settings', 'main', patch, 8000);
-          step.status = 'ok';
-          step.detail = signedOut ? 'সাইন-ইন লাগবে' : (window.__cloudErr ? 'লোকাল সেভ' : 'সারি সেভ');
-          window.__calcMsg = signedOut
-            ? 'Hisab-এ আবার ঢুকতে হবে। কুরিয়ার চেক শুরু হয়নি।'
-            : failed.length
-              ? 'New sheet row added. Where a check failed, the old number was kept.'
-              : (window.__cloudErr
-                ? 'Checks finished. Sheet kept on this device (cloud save slow).'
-                : 'Fresh data saved and a new sheet row was added.');
-        } catch (err) {
-          step.status = 'fail';
-          step.detail = err.message || 'Save failed';
-          window.__calcMsg = err.message || 'Calculate failed';
-          // Don't abort the whole calculate UI — show fail on Live Sheet step only.
-        }
-        paintCalcProgress();
-        continue;
-      }
-      try {
-        const skipped = await withTimeout(Promise.resolve().then(() => fn()), 100000, name + ' timed out');
-        const message = skipped === 'busy'
-          ? 'Already running, skipped'
-          : (errOf() || '');
-        if (message) {
-          syncErrors.push({ name, message, at });
-          failed.push(name + ': ' + message);
-          step.status = 'fail';
-          step.detail = message;
-        } else {
-          step.status = 'ok';
-          step.detail = skipped === '' ? '' : 'ঠিক আছে';
-        }
-      } catch (err) {
-        const message = err.message || 'Check failed';
-        syncErrors.push({ name, message, at });
-        failed.push(name + ': ' + message);
-        step.status = 'fail';
-        step.detail = message;
-      }
-      paintCalcProgress();
+    // Full calculate runs on the VPS — browser only triggers and shows progress.
+    window.__calcMsg = 'Server calculate running (browser can close)…';
+    paintCalcProgress();
+    const res = await api('/api/calculate', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ source: manual ? 'manual' : 'calculate', by: user || 'browser' }),
+      timeoutMs: 360000
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 409 || data.busy) {
+      window.__calcMsg = 'Server already calculating — wait for the shared Live Sheet to update';
+      if (manual) toast(window.__calcMsg);
+    } else if (!res.ok) {
+      throw new Error(data.error || 'Server calculate failed');
+    } else {
+      const steps = Array.isArray(data.steps) ? data.steps : [];
+      window.__calcSteps = jobNames.map(name => {
+        const hit = steps.find(s => s.name === name);
+        return hit ? { name, status: hit.status || 'ok', detail: hit.detail || '' } : { name, status: 'ok', detail: 'server' };
+      });
+      const failed = steps.filter(s => s.status === 'fail');
+      window.__calcMsg = failed.length
+        ? 'Server finished. Some checks failed; Live Sheet still updated from what succeeded.'
+        : 'Server saved fresh numbers to Firestore — every browser will see the same Live Sheet.';
+      if (manual) toast(window.__calcMsg);
     }
-    if (manual) toast(window.__calcMsg);
   } catch (err) {
     window.__calcMsg = err.message || 'Calculate failed';
+    (window.__calcSteps || []).forEach(s => {
+      if (s.status === 'pending' || s.status === 'run') { s.status = 'fail'; s.detail = window.__calcMsg; }
+    });
     if (manual) toast(window.__calcMsg);
   } finally {
     clearInterval(pulse);
@@ -3171,7 +3091,7 @@ const VIEWS = {
   errors() {
     const list = cfg().syncErrors || [];
     return `<div class="card"><h3>Check errors</h3>
-      <p class="muted">Every ${Math.max(0, Number(cfg().interval) || 0) || '—'} minutes, the time chosen in Settings, Hisab signs in to Steadfast, Pathao and EcomDrive and saves fresh numbers, then adds a Live Sheet row. If one check fails, that number stays as it was and the reason is listed here. The row is removed after the next successful check.</p>
+      <p class="muted">Every ${Math.max(0, Number(cfg().interval) || 0) || '—'} minutes the <b>production server</b> pulls Steadfast, Pathao and EcomDrive, writes balances + a Live Sheet row to Firestore — even if this browser is closed. Open any phone/PC to see the same sheet.</p>
       <p class="muted">Last full check: ${cfg().lastCalcAt ? dt(cfg().lastCalcAt) : 'not yet'}</p>
       <button class="btn primary" data-click="calculateNow" ${window.__calcBusy ? 'disabled' : ''}>${esc(calcBtnLabel())}</button>
       ${window.__calcMsg ? `<p class="muted">${esc(window.__calcMsg)}</p>` : ''}</div>

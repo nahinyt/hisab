@@ -15,7 +15,7 @@ ENV NODE_ENV=production \
     TRUST_PROXY=1 \
     HISAB_DATA_DIR=/data
 
-RUN mkdir -p /data && chown -R node:node /app /data
+RUN npm ci --omit=dev && mkdir -p /data && chown -R node:node /app /data
 
 USER node
 EXPOSE 8787
