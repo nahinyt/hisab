@@ -293,6 +293,17 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
     busy = false;
     throw new Error('Firestore not configured on server (FIREBASE_AUTH_EMAIL / FIREBASE_AUTH_PASSWORD + FIREBASE_*)');
   }
+  // Fail fast with a clear message if Google Cloud disabled the Firestore API.
+  try {
+    await getMainSettings();
+  } catch (err) {
+    busy = false;
+    const msg = err.message || String(err);
+    if (/has not been used|disabled|PERMISSION_DENIED/i.test(msg)) {
+      throw new Error('Cloud Firestore API is disabled for this Firebase project. Enable it: https://console.developers.google.com/apis/api/firestore.googleapis.com/overview?project=' + (process.env.FIREBASE_PROJECT_ID || ''));
+    }
+    throw err;
+  }
   const startedAt = liveStartedAt || new Date().toISOString();
   const steps = liveSteps;
   try {
