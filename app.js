@@ -1869,33 +1869,62 @@ async function calculateNow(manual) {
   if (manual) render(true);
   paintCalcProgress();
   try {
-    // Full calculate runs on the VPS — browser only triggers and shows progress.
-    window.__calcMsg = 'Server calculate running (browser can close)…';
+    // Start on VPS (202) then poll — Cloudflare 504s if we wait for the full pull on one request.
+    window.__calcMsg = 'Server calculate starting…';
     paintCalcProgress();
     const res = await api('/api/calculate', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ source: manual ? 'manual' : 'calculate', by: user || 'browser' }),
-      timeoutMs: 360000
+      timeoutMs: 30000
     });
     const data = await res.json().catch(() => ({}));
-    if (res.status === 409 || data.busy) {
-      window.__calcMsg = 'Server already calculating — wait for the shared Live Sheet to update';
-      if (manual) toast(window.__calcMsg);
-    } else if (!res.ok) {
-      throw new Error(data.error || 'Server calculate failed');
-    } else {
-      const steps = Array.isArray(data.steps) ? data.steps : [];
-      window.__calcSteps = jobNames.map(name => {
-        const hit = steps.find(s => s.name === name);
-        return hit ? { name, status: hit.status || 'ok', detail: hit.detail || '' } : { name, status: 'ok', detail: 'server' };
-      });
-      const failed = steps.filter(s => s.status === 'fail');
-      window.__calcMsg = failed.length
-        ? 'Server finished. Some checks failed; Live Sheet still updated from what succeeded.'
-        : 'Server saved fresh numbers to Firestore — every browser will see the same Live Sheet.';
-      if (manual) toast(window.__calcMsg);
+    if (res.status === 409 && !data.busy && !data.started) {
+      throw new Error(data.error || 'Server rejected calculate');
     }
+    if (!res.ok && res.status !== 202 && res.status !== 409) {
+      throw new Error(data.error || ('Server calculate failed (' + res.status + ')'));
+    }
+    window.__calcMsg = data.started === false && data.busy
+      ? 'Server already calculating — watching progress…'
+      : 'Server calculate running (browser can close)…';
+    paintCalcProgress();
+    const deadline = Date.now() + 12 * 60000;
+    let final = data;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 2000));
+      const st = await api('/api/calculate/status', { timeoutMs: 15000 });
+      const body = await st.json().catch(() => ({}));
+      if (!st.ok) throw new Error(body.error || 'Could not read calculate status');
+      final = body;
+      const steps = Array.isArray(body.steps) ? body.steps : [];
+      if (steps.length) {
+        window.__calcSteps = jobNames.map(name => {
+          const hit = steps.find(s => s.name === name);
+          return hit
+            ? { name, status: hit.status || 'pending', detail: hit.detail || '' }
+            : { name, status: body.busy ? 'pending' : 'ok', detail: '' };
+        });
+        const running = steps.find(s => s.status === 'run');
+        window.__calcMsg = running
+          ? ('Server · ' + running.name + (running.detail ? ' · ' + running.detail : '…'))
+          : (body.busy ? 'Server calculate running…' : window.__calcMsg);
+        paintCalcProgress();
+      }
+      if (!body.busy) break;
+    }
+    if (final.busy) throw new Error('Server calculate still running — check again in a minute');
+    const steps = Array.isArray(final.steps) ? final.steps : (final.lastRun?.steps || []);
+    window.__calcSteps = jobNames.map(name => {
+      const hit = steps.find(s => s.name === name);
+      return hit ? { name, status: hit.status || 'ok', detail: hit.detail || '' } : { name, status: 'ok', detail: 'server' };
+    });
+    if (final.lastRun?.error) throw new Error(final.lastRun.error);
+    const failed = steps.filter(s => s.status === 'fail');
+    window.__calcMsg = failed.length
+      ? 'Server finished. Some checks failed; Live Sheet still updated from what succeeded.'
+      : 'Server saved fresh numbers to Firestore — every browser will see the same Live Sheet.';
+    if (manual) toast(window.__calcMsg);
   } catch (err) {
     window.__calcMsg = err.message || 'Calculate failed';
     (window.__calcSteps || []).forEach(s => {

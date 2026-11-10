@@ -2,5 +2,12 @@
 # Map host HISAB_PORT (default 8080) → container :8080 only.
 :8080 {
 	encode gzip zstd
-	reverse_proxy app:8787
+	# Calculate is async (202), but keep long timeouts for individual sync routes.
+	reverse_proxy app:8787 {
+		transport http {
+			response_header_timeout 120s
+			read_timeout 120s
+			write_timeout 120s
+		}
+	}
 }

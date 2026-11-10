@@ -6,7 +6,7 @@ import { checkAccounts, checkCourierHistory, checkDollar, checkExpenses, checkRe
 import { checkSteadfast } from './steadfast.mjs';
 import { checkPathao } from './pathao.mjs';
 import { checkPassword, clearFails, createPassword, endSession, hasPassword, markFail, sessionOk, startSession, tooManyFails } from './auth.mjs';
-import { calculateStatus, runCalculate, tickSchedule } from './calculate.mjs';
+import { calculateStatus, startCalculate, tickSchedule } from './calculate.mjs';
 import { firestoreConfigured } from './firestore.mjs';
 
 const workerDir = path.dirname(fileURLToPath(import.meta.url));
@@ -364,11 +364,12 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'POST' && url.pathname === '/api/calculate') {
     try {
       const body = JSON.parse(await readBody(req, 4000) || '{}');
-      const payload = await runCalculate({
+      const payload = startCalculate({
         source: body.source === 'manual' ? 'calculate' : (body.source || 'calculate'),
         by: body.by || 'server'
       });
-      send(res, payload.busy && !payload.ok ? 409 : 200, JSON.stringify(payload), 'application/json; charset=utf-8', origin);
+      // 202 = accepted; Cloudflare must not wait for Steadfast/EcomDrive (that caused 504).
+      send(res, payload.started ? 202 : 409, JSON.stringify(payload), 'application/json; charset=utf-8', origin);
     } catch (err) {
       send(res, 502, JSON.stringify({ error: err.message || 'Calculate failed', steps: [] }), 'application/json; charset=utf-8', origin);
     }

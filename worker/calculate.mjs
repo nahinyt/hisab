@@ -22,9 +22,37 @@ const smsPath = process.env.HISAB_SMS_FILE || path.join(dataDir, 'sms-balances.j
 
 let busy = false;
 let lastRun = null;
+let liveSteps = [];
+let liveStartedAt = null;
 
 export function calculateStatus() {
-  return { busy, lastRun, firestore: firestoreConfigured() };
+  return {
+    busy,
+    lastRun,
+    steps: busy ? liveSteps : (lastRun?.steps || liveSteps),
+    startedAt: liveStartedAt,
+    firestore: firestoreConfigured()
+  };
+}
+
+/** Start calculate in the background so Cloudflare/Caddy cannot 504 the HTTP request. */
+export function startCalculate(opts = {}) {
+  if (busy) return { ok: false, busy: true, started: false, ...calculateStatus() };
+  // Claim lock immediately (before the async body schedules) to prevent double-starts.
+  busy = true;
+  liveSteps = [];
+  liveStartedAt = new Date().toISOString();
+  void runCalculate({ ...opts, _lockHeld: true }).catch(err => {
+    console.error('calculate', err.message || err);
+    lastRun = {
+      at: liveStartedAt,
+      finishedAt: new Date().toISOString(),
+      ok: false,
+      error: err.message || String(err),
+      steps: liveSteps.slice()
+    };
+  });
+  return { ok: true, busy: true, started: true, startedAt: liveStartedAt };
 }
 
 function dkDate(d) {
@@ -252,16 +280,21 @@ async function step(name, fn, steps) {
   return row;
 }
 
-export async function runCalculate({ source = 'calculate', by = 'server' } = {}) {
-  if (busy) {
-    return { ok: false, busy: true, error: 'Calculate already running', lastRun };
+export async function runCalculate({ source = 'calculate', by = 'server', _lockHeld = false } = {}) {
+  if (!_lockHeld) {
+    if (busy) {
+      return { ok: false, busy: true, error: 'Calculate already running', lastRun };
+    }
+    busy = true;
+    liveSteps = [];
+    liveStartedAt = new Date().toISOString();
   }
   if (!firestoreConfigured()) {
+    busy = false;
     throw new Error('Firestore not configured on server (FIREBASE_AUTH_EMAIL / FIREBASE_AUTH_PASSWORD + FIREBASE_*)');
   }
-  busy = true;
-  const startedAt = new Date().toISOString();
-  const steps = [];
+  const startedAt = liveStartedAt || new Date().toISOString();
+  const steps = liveSteps;
   try {
     let settings = await getMainSettings();
     let items = await listDocs('items');
