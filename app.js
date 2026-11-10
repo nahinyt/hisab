@@ -3568,8 +3568,9 @@ document.addEventListener('click', async e => {
       finally { window.__sheetClearing = false; render(true); }
     }
     else if (a === 'logout') {
-      if (DEMO) { await api('/api/logout', { method: 'POST' }); location.reload(); }
-      else A.auth?.logout();
+      try { await api('/api/logout', { method: 'POST' }); } catch { /* session may already be gone */ }
+      try { if (!DEMO) await A.auth?.logout?.(); } catch { /* ignore */ }
+      location.reload();
     }
     else if (a === 'wipe') { await A.wipe(); location.reload(); }
   } catch (err) { toast(err.message); }
@@ -3774,7 +3775,26 @@ function loginMessage(status, data) {
   if (data.error === 'wrong email') return 'এই ইমেইল দিয়ে অ্যাকাউন্ট খোলা যাবে না।';
   if (data.error === 'at least 10') return 'কমপক্ষে ১০ অক্ষর দিন।';
   if (data.error === 'already set') return 'পাসওয়ার্ড আগেই আছে। ইমেইল আর পাসওয়ার্ড দিয়ে ঢুকুন।';
+  if (data.error === 'no email') return 'সার্ভারে HISAB_EMAIL সেট নেই — VPS-এ worker/.env চেক করুন।';
   return 'ঢোকা যায়নি।';
+}
+/** Production (non-loopback) needs hisab_session for Calculate APIs; localhost loopback does not. */
+async function apiGate() {
+  try {
+    const res = await api('/api/session');
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) return { gate: false, setup: false, offline: false };
+    // If the worker still answers calc routes without a cookie, we are on this computer.
+    const probe = await api('/api/sms/balance');
+    if (probe.status !== 401) return { gate: false, setup: !!data.setup, offline: false };
+    return { gate: true, setup: !!data.setup, offline: false };
+  } catch {
+    // Offline worker: still open UI on localhost; production must show the form.
+    if (location.hostname === '127.0.0.1' || location.hostname === 'localhost') {
+      return { gate: false, setup: false, offline: true };
+    }
+    return { gate: true, setup: false, offline: true };
+  }
 }
 function showLogin(setup, offline) {
   window.__loginSetup = !!setup;
@@ -3787,8 +3807,8 @@ function showLogin(setup, offline) {
   $('#password2').required = !!setup;
   $('#password').autocomplete = setup ? 'new-password' : 'current-password';
   $('#loginHint').textContent = setup
-    ? 'ইমেইল আর একটি পাসওয়ার্ড দিন। পাসওয়ার্ড কমপক্ষে ১০ অক্ষর। এটা EcomDrive বা কুরিয়ারের পাসওয়ার্ড না।'
-    : 'ইমেইল আর পাসওয়ার্ড দিয়ে ঢুকুন।';
+    ? 'প্রোডাকশনে প্রথমবার: ইমেইল আর একটি পাসওয়ার্ড দিন (কমপক্ষে ১০ অক্ষর)। এটা Hisab সার্ভার লক — EcomDrive/কুরিয়ার পাসওয়ার্ড না।'
+    : 'ইমেইল আর পাসওয়ার্ড দিয়ে ঢুকুন। Calculate API-র জন্য সেশন লাগবে।';
   $('#loginBtn').textContent = setup ? 'পাসওয়ার্ড সেভ করুন' : 'ঢুকুন';
   $('#loginErr').textContent = offline ? 'সার্ভার বন্ধ। worker ফোল্ডারে node server.mjs চালু আছে কিনা দেখুন।' : '';
 }
@@ -3796,26 +3816,33 @@ function showLogin(setup, offline) {
 document.addEventListener('submit', async e => {
   if (e.target.id !== 'loginForm') return; e.preventDefault();
   $('#loginErr').textContent = '';
-    const email = $('#email').value.trim();
-    const password = $('#password').value;
-    try {
-      if (!DEMO) { await A.auth.login(email, password); return; }
-      if (!email.includes('@')) { $('#loginErr').textContent = 'ইমেইল দিন।'; return; }
-      if (window.__loginSetup) {
-        if (password.length < 10) { $('#loginErr').textContent = 'কমপক্ষে ১০ অক্ষর দিন।'; return; }
-        if (password !== $('#password2').value) { $('#loginErr').textContent = 'দুইবার একই পাসওয়ার্ড দিন।'; return; }
-      }
-      const res = await api(window.__loginSetup ? '/api/setup' : '/api/login', {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password })
-      });
+  const email = $('#email').value.trim();
+  const password = $('#password').value;
+  try {
+    if (!email.includes('@')) { $('#loginErr').textContent = 'ইমেইল দিন।'; return; }
+    if (window.__loginSetup) {
+      if (password.length < 10) { $('#loginErr').textContent = 'কমপক্ষে ১০ অক্ষর দিন।'; return; }
+      if (password !== $('#password2').value) { $('#loginErr').textContent = 'দুইবার একই পাসওয়ার্ড দিন।'; return; }
+    }
+    // Always create hisab_session — without it production Calculate returns 401.
+    const res = await api(window.__loginSetup ? '/api/setup' : '/api/login', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email, password })
+    });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) { $('#loginErr').textContent = loginMessage(res.status, data); return; }
+    if (!DEMO && A.auth?.login) {
+      try { await A.auth.login(email, password); }
+      catch (err) {
+        $('#loginErr').textContent = 'Firebase: ' + (err.message || 'sign-in failed');
+        return;
+      }
+    }
     user = email;
     $('#password').value = '';
     $('#password2').value = '';
     start();
   } catch (err) {
-    $('#loginErr').textContent = DEMO ? 'সার্ভার বন্ধ। node server.mjs চালু আছে কিনা দেখুন।' : 'Sign-in failed: ' + err.message;
+    $('#loginErr').textContent = 'সার্ভার বন্ধ বা সাইন-ইন ব্যর্থ: ' + (err.message || '');
   }
 });
 
@@ -3832,7 +3859,7 @@ function exportCsv() {
 function start() {
   $('#login').classList.add('hidden');
   $('#app').classList.remove('hidden');
-  const out = $('#logoutBtn'); if (out) out.classList.add('hidden');
+  const out = $('#logoutBtn'); if (out) out.classList.remove('hidden');
   window.__signedOut = false;
   calcBusyElsewhere(); // drops stale lock from a hung prior tab
   if (started) return;
@@ -3881,6 +3908,12 @@ function start() {
 }
 (async function boot() {
   A = DEMO ? localAdapter() : await fsAdapter();
+  const gate = await apiGate();
+  if (gate.gate) {
+    // Production: do not auto-anonymous into the app — Calculate APIs need hisab_session first.
+    showLogin(gate.setup, gate.offline);
+    return;
+  }
   if (!DEMO) {
     try {
       const u = await A.auth.open();
