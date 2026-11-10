@@ -1,4 +1,5 @@
 # Secrets & local runtime (never commit)
+.env
 worker/.env
 worker/auth.json
 worker/.steadfast-session.json
