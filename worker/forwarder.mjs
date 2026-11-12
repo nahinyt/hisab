@@ -7,7 +7,7 @@
 //
 // Destination contract — PackKoro /api/ecomdrive/invoice (Authorization: Bearer <key>):
 //   200 + matched_orders > 0 → forwarded (done)    200 + duplicate/already_assigned_to → exists (done)
-//   200 + matched_orders = 0 → no_match (retried while the order is still pending)
+//   200 + matched_orders = 0 → no_match ("Not matched"; never retried automatically, only by manual Retry)
 //   409 → exists, 404 → no_match (generic APIs)    401/403/503 → failed, run stops, backoff retry
 //   429/408/5xx/network/timeout → failed (backoff)  400/413/415/422 → failed (rejected; manual retry)
 import fs from 'fs';
@@ -304,7 +304,8 @@ async function sendOne(row, settings) {
   const attempts = (d().prepare('SELECT attempts FROM invoices WHERE invoice_id = ?').get(row.invoice_id)?.attempts || 0) + 1;
   const msg = cls.why + (got.text && got.status != null ? ' — ' + scrub(got.text, settings.apiKey).slice(0, 200) : '');
   let next = null;
-  if (cls.state === 'no_match') next = new Date(Date.now() + settings.noMatchRetryMin * 60000).toISOString();
+  // Not matched: never retried automatically — only the manual Retry button sends it again.
+  if (cls.state === 'no_match') next = null;
   else if (cls.state === 'failed' && !cls.rejected) next = new Date(Date.now() + backoffMin(attempts) * 60000).toISOString();
   d().prepare(`UPDATE invoices SET status = ?, attempts = ?, last_attempt_at = ?, last_http = ?, last_message = ?, next_retry_at = ?,
       forwarded_at = CASE WHEN ? IN ('forwarded','exists') THEN ? ELSE forwarded_at END, claimed_at = NULL
@@ -348,9 +349,9 @@ export async function runSync({ trigger = 'auto' } = {}) {
       if (!settings.apiUrl || !settings.apiKey) {
         summary.error = 'Set the API URL and API key to start forwarding';
       } else {
-        // No-match rows are retried only while the order is still pending in Ecom Drive (seen in this scan).
-        const due = d().prepare(`SELECT * FROM invoices WHERE (status IN ('new','failed') OR (status = 'no_match' AND last_seen_at >= ?))
-            AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY first_seen_at LIMIT 200`).all(at, now());
+        // Not-matched rows are never picked up here; a manual Retry moves them back to 'new'.
+        const due = d().prepare(`SELECT * FROM invoices WHERE status IN ('new','failed')
+            AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY first_seen_at LIMIT 200`).all(now());
         let lastSend = 0;
         for (const row of due) {
           // PackKoro allows 60 requests/minute per IP: keep sends ~1.1s apart.
@@ -381,12 +382,14 @@ export async function runSync({ trigger = 'auto' } = {}) {
 /** Retry: make failed / no-match rows due now. Never touches finished rows. */
 export function retry({ invoiceId, which = 'failed' } = {}) {
   const at = now();
+  // Not matched / invalid go back to the queue ('new'); errors just become due now.
+  const requeue = `next_retry_at = ?, status = CASE WHEN status IN ('no_match','invalid') THEN 'new' ELSE status END`;
   if (invoiceId) {
-    return d().prepare(`UPDATE invoices SET next_retry_at = ?, status = CASE WHEN status = 'invalid' THEN 'new' ELSE status END
-      WHERE invoice_id = ? AND status IN ('failed','no_match','invalid','new')`).run(at, invoiceId).changes;
+    return d().prepare(`UPDATE invoices SET ${requeue} WHERE invoice_id = ? AND status IN ('failed','no_match','invalid','new')`).run(at, invoiceId).changes;
   }
-  const states = which === 'all' ? ['failed', 'no_match'] : [which === 'no_match' ? 'no_match' : 'failed'];
-  return d().prepare(`UPDATE invoices SET next_retry_at = ? WHERE status IN (${states.map(() => '?').join(',')})`).run(at, ...states).changes;
+  const states = which === 'all' ? ['failed', 'invalid', 'no_match']
+    : which === 'no_match' ? ['no_match'] : ['failed', 'invalid'];
+  return d().prepare(`UPDATE invoices SET ${requeue} WHERE status IN (${states.map(() => '?').join(',')})`).run(at, ...states).changes;
 }
 
 // ---------- scheduler ----------
@@ -404,11 +407,10 @@ export function forwarderStatus({ filter = '', search = '', limit = 200 } = {}) 
   const stats = {
     ordersDiscovered: Number(kvGet('orders_discovered', '0')),
     uniqueInvoices: count('SELECT COUNT(*) n FROM invoices'),
-    forwarded: count("SELECT COUNT(*) n FROM invoices WHERE status IN ('forwarded','exists')"),
-    pending: count("SELECT COUNT(*) n FROM invoices WHERE status IN ('new','sending')"),
-    noMatch: count("SELECT COUNT(*) n FROM invoices WHERE status = 'no_match'"),
-    failed: count("SELECT COUNT(*) n FROM invoices WHERE status = 'failed'"),
-    invalid: count("SELECT COUNT(*) n FROM invoices WHERE status = 'invalid'"),
+    matched: count("SELECT COUNT(*) n FROM invoices WHERE status IN ('forwarded','exists')"),
+    notMatched: count("SELECT COUNT(*) n FROM invoices WHERE status = 'no_match'"),
+    errors: count("SELECT COUNT(*) n FROM invoices WHERE status IN ('failed','invalid')"),
+    queued: count("SELECT COUNT(*) n FROM invoices WHERE status IN ('new','sending')"),
     failedAttempts: count("SELECT COUNT(*) n FROM attempts WHERE result = 'failed'"),
     duplicatesSkipped: Number(kvGet('duplicates_skipped', '0')),
     lastSyncAt: kvGet('last_sync_at') || null,
@@ -416,8 +418,8 @@ export function forwarderStatus({ filter = '', search = '', limit = 200 } = {}) 
   };
   const where = [];
   const args = [];
-  if (filter === 'done') where.push("status IN ('forwarded','exists')");
-  else if (filter) { where.push('status = ?'); args.push(filter); }
+  const FILTERS = { matched: "('forwarded','exists')", not_matched: "('no_match')", error: "('failed','invalid')", queued: "('new','sending')" };
+  if (FILTERS[filter]) where.push('status IN ' + FILTERS[filter]);
   if (search) { where.push('(invoice_id LIKE ? OR phone LIKE ? OR name LIKE ?)'); args.push(`%${search}%`, `%${search}%`, `%${search}%`); }
   const rows = d().prepare(`SELECT invoice_id, phone, name, courier, cod_amount, status, attempts, last_attempt_at, last_http, last_message,
       first_seen_at, last_seen_at, next_retry_at, forwarded_at FROM invoices ${where.length ? 'WHERE ' + where.join(' AND ') : ''}

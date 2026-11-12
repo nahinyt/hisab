@@ -3254,8 +3254,8 @@ function itemStatement(id) {
 
 // ---------- Invoice forwarder (Ecom Drive → PackKoro) ----------
 const FWD_STATUS = {
-  new: ['Queued', 'pending'], sending: ['Sending', 'pending'], forwarded: ['Forwarded', 'ok'], exists: ['Already on PackKoro', 'ok'],
-  no_match: ['No matching order', 'warn'], failed: ['Failed', 'fail'], invalid: ['Invalid data', 'fail']
+  new: ['Queued', 'pending'], sending: ['Sending', 'pending'], forwarded: ['Matched', 'ok'], exists: ['Matched', 'ok'],
+  no_match: ['Not matched', 'warn'], failed: ['Error', 'fail'], invalid: ['Error', 'fail']
 };
 function fwdEnsurePolling() {
   if (window.__fwdTimer) return;
@@ -3296,7 +3296,7 @@ function fwdPaintButtons(st) {
 function fwdLiveHtml(st) {
   const k = st.stats, c = st.connection, s = st.settings, lr = st.lastRun;
   const tile = (label, v, cls = '', hint = '') => `<div class="fwd-tile ${cls}"><span>${label}</span><b>${v}</b>${hint ? `<small>${hint}</small>` : ''}</div>`;
-  const filters = [['', 'All'], ['new', 'Queued'], ['done', 'Forwarded'], ['failed', 'Failed'], ['no_match', 'No match'], ['invalid', 'Invalid']];
+  const filters = [['', 'All'], ['matched', 'Matched'], ['not_matched', 'Not matched'], ['error', 'Error'], ['queued', 'Queued']];
   const f = window.__fwdFilter || '';
   const pill = r => { const [label, tone] = FWD_STATUS[r.status] || [r.status, '']; return `<span class="fwd-pill ${tone}">${esc(label)}</span>`; };
   const sentBits = lr ? Object.entries(lr.sent || {}).map(([x, n]) => ` · ${n} ${esc(((FWD_STATUS[x] || [x])[0]).toLowerCase())}`).join('') : '';
@@ -3316,23 +3316,25 @@ function fwdLiveHtml(st) {
       <span class="muted">· Automation ${s.enabled ? `<b class="pos">ON</b> every ${s.intervalMin} min` : '<b>OFF</b>'}${st.running ? ' · <b>syncing now…</b>' : ''}</span>
     </div>
     <p class="muted fwd-lastrun">Last run: ${lastRunText}</p>
+    <div class="fwd-main">
+      ${tile('Matched', k.matched, 'ok', 'PackKoro অর্ডারে invoice বসেছে')}
+      ${tile('Not matched', k.notMatched, 'warn', 'ওই ফোনে অর্ডার নেই · নিজে Retry দিন')}
+      ${tile('Error', k.errors, 'fail', 'সার্ভার ত্রুটি বা গ্রহণ করেনি')}
+    </div>
     <div class="fwd-tiles">
-      ${tile('Orders discovered', k.ordersDiscovered, '', 'all scans, total')}
+      ${tile('Queued', k.queued, 'pending', 'পাঠানোর অপেক্ষায়')}
       ${tile('Unique invoice IDs', k.uniqueInvoices)}
-      ${tile('Forwarded', k.forwarded, 'ok', 'incl. already on PackKoro')}
-      ${tile('Pending', k.pending, 'pending', 'queued to send')}
-      ${tile('Failed', k.failed, 'fail', `${k.failedAttempts} failed attempts`)}
-      ${tile('No match', k.noMatch, 'warn', `retried every ${s.noMatchRetryMin} min`)}
-      ${tile('Duplicates skipped', k.duplicatesSkipped, '', 'already forwarded, not sent again')}
+      ${tile('Orders discovered', k.ordersDiscovered, '', 'all scans, total')}
+      ${tile('Duplicates skipped', k.duplicatesSkipped, '', 'আগেই matched, আবার পাঠানো হয়নি')}
       ${tile('Last sync', k.lastSyncAt ? dt(k.lastSyncAt) : '—', 'date')}
-      ${tile('Last success', k.lastSuccessAt ? dt(k.lastSuccessAt) : '—', 'date')}
+      ${tile('Last match', k.lastSuccessAt ? dt(k.lastSuccessAt) : '—', 'date')}
     </div>
     <div class="card">
       <div class="fwd-bar">
         <div class="fwd-filters">${filters.map(([v, l]) => `<button class="btn sm ${f === v ? 'on' : ''}" data-click="fwdFilter" data-f="${v}">${l}</button>`).join('')}</div>
         <div class="fwd-actions">
-          <button class="btn sm" data-click="fwdRetry" data-which="failed" ${k.failed ? '' : 'disabled'}>Retry failed (${k.failed})</button>
-          <button class="btn sm" data-click="fwdRetry" data-which="no_match" ${k.noMatch ? '' : 'disabled'}>Retry no-match (${k.noMatch})</button>
+          <button class="btn sm" data-click="fwdRetry" data-which="no_match" ${k.notMatched ? '' : 'disabled'}>Retry not matched (${k.notMatched})</button>
+          <button class="btn sm" data-click="fwdRetry" data-which="failed" ${k.errors ? '' : 'disabled'}>Retry errors (${k.errors})</button>
         </div>
       </div>
       <div class="tw"><table class="fwd-table"><tr><th>Invoice ID</th><th>Phone</th><th>Name</th><th>Courier</th><th class="n">COD</th><th>Status</th><th class="n">Tries</th><th>Last attempt</th><th>Response</th><th></th></tr>
@@ -3352,7 +3354,7 @@ document.addEventListener('submit', async e => {
   const f = e.target.closest('[data-fwd-form]'); if (!f) return;
   e.preventDefault(); e.stopImmediatePropagation();
   const fd = new FormData(f);
-  const patch = { apiUrl: fd.get('apiUrl'), intervalMin: fd.get('intervalMin'), noMatchRetryMin: fd.get('noMatchRetryMin') };
+  const patch = { apiUrl: fd.get('apiUrl'), intervalMin: fd.get('intervalMin') };
   if (String(fd.get('apiKey') || '').trim()) patch.apiKey = fd.get('apiKey');
   try {
     await fwdPost('/api/forwarder/settings', patch);
@@ -3464,7 +3466,6 @@ const VIEWS = {
         <label>Destination API URL<input name="apiUrl" type="url" required placeholder="https://packkoro.com/api/ecomdrive/invoice" value="${esc(s.apiUrl)}"></label>
         <label>API key <small class="muted">${s.hasKey ? 'saved ' + esc(s.keyMask) + ' — leave empty to keep' : 'not set'}</small><input name="apiKey" type="password" autocomplete="new-password" placeholder="${s.hasKey ? '••••••••' : 'Bearer token'}"></label>
         <label>Polling interval (minutes)<input name="intervalMin" type="number" min="1" max="1440" value="${s.intervalMin}"></label>
-        <label>No-match retry after (minutes)<input name="noMatchRetryMin" type="number" min="5" max="10080" value="${s.noMatchRetryMin}"></label>
         <div class="fwd-form-btns"><button class="btn primary">Save settings</button> <button type="button" class="btn" data-click="fwdTest">Test connection</button></div>
       </form>
       <p class="muted">API key সার্ভারে থাকে, ব্রাউজারে ফেরত আসে না। পাঠানো হয় <code>Authorization: Bearer …</code> হেডারে। Body হুবহু: <code>{"phone","name","address","cod_amount","invoice_id"}</code>।</p>

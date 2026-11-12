@@ -294,3 +294,10 @@ tr.click-row td:first-child{color:var(--brand2);font-weight:600;text-decoration:
 .fwd-raw h5{margin:4px 0 6px;font-size:12px;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
 .fwd-raw pre{margin:0;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:10px 12px;font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}
 @media(max-width:780px){.fwd-raw-grid{grid-template-columns:1fr}}
+.fwd-main{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-bottom:10px}
+.fwd-main .fwd-tile{padding:14px 16px;border-width:1.5px}
+.fwd-main .fwd-tile b{font-size:30px}
+.fwd-main .fwd-tile.ok{border-color:#bfe8cf;background:#f3fbf6}
+.fwd-main .fwd-tile.warn{border-color:#f5dfa6;background:#fffbeb}
+.fwd-main .fwd-tile.fail{border-color:#f4c7c3;background:#fff7f6}
+@media(max-width:560px){.fwd-main{grid-template-columns:1fr}.fwd-main .fwd-tile{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}.fwd-main .fwd-tile b{font-size:24px;order:-1}}
