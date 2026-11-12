@@ -288,3 +288,9 @@ tr.click-row td:first-child{color:var(--brand2);font-weight:600;text-decoration:
 .fwd-cfg{margin-top:14px}
 .fwd-form-btns{display:flex;gap:8px;align-items:end}
 .fwd-tile.date b{font-size:14px;line-height:1.35;margin-top:5px}
+.fwd-raw{border:1px solid var(--line);border-radius:12px;padding:8px 10px;margin:8px 0;background:var(--card)}
+.fwd-raw summary{cursor:pointer;font-size:13px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.fwd-raw-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px}
+.fwd-raw h5{margin:4px 0 6px;font-size:12px;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+.fwd-raw pre{margin:0;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:10px 12px;font:12px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}
+@media(max-width:780px){.fwd-raw-grid{grid-template-columns:1fr}}

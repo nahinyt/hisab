@@ -5,10 +5,11 @@
 // 'forwarded' or 'exists' can never be claimed again, so it is never sent twice — across
 // rescans, page refreshes, restarts and overlapping runs.
 //
-// Destination contract (HTTP status, Authorization: Bearer <key>):
-//   2xx → forwarded (done)   409 → exists (done)   404 → no_match (controlled retry)
-//   401/403 → failed (auth)  408/429/5xx/network/timeout → failed (backoff retry)
-//   other 4xx → failed (rejected; manual retry)
+// Destination contract — PackKoro /api/ecomdrive/invoice (Authorization: Bearer <key>):
+//   200 + matched_orders > 0 → forwarded (done)    200 + duplicate/already_assigned_to → exists (done)
+//   200 + matched_orders = 0 → no_match (retried while the order is still pending)
+//   409 → exists, 404 → no_match (generic APIs)    401/403/503 → failed, run stops, backoff retry
+//   429/408/5xx/network/timeout → failed (backoff)  400/413/415/422 → failed (rejected; manual retry)
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -21,6 +22,7 @@ const PAGE = 50;
 const SEND_TIMEOUT_MS = 15000;
 const IN_RUN_TRIES = 3;           // network/5xx retries inside one run: 1s, 2s
 const STALE_SENDING_MS = 10 * 60000;
+const SEND_GAP_MS = Number(process.env.FORWARDER_SEND_GAP_MS ?? 1100);
 
 let db = null;
 let dbPath = '';
@@ -71,6 +73,9 @@ export function openForwarder(file) {
     CREATE INDEX IF NOT EXISTS attempts_invoice ON attempts(invoice_id, id);
     CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
   `);
+  for (const col of ['request_url TEXT', 'request_body TEXT', 'duration_ms INTEGER']) {
+    try { db.exec('ALTER TABLE attempts ADD COLUMN ' + col); } catch { /* already there */ }
+  }
   return db;
 }
 
@@ -227,18 +232,39 @@ function scrub(text, key) {
   return t.replace(/(bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[redacted]');
 }
 
-function classify(status) {
-  if (status >= 200 && status < 300) return { state: 'forwarded', why: 'Assigned on PackKoro' };
-  if (status === 409) return { state: 'exists', why: 'Already exists on PackKoro' };
-  if (status === 404) return { state: 'no_match', why: 'PackKoro found no matching order' };
-  if (status === 401 || status === 403) return { state: 'failed', why: 'API key rejected (HTTP ' + status + ')', transient: false };
-  if (status === 408 || status === 429 || status >= 500) return { state: 'failed', why: 'Destination error (HTTP ' + status + ')', transient: true };
-  return { state: 'failed', why: 'Rejected by destination (HTTP ' + status + ')', transient: false, rejected: true };
+/** PackKoro reports the outcome in the body of a 200, not only in the status code. */
+export function classify(status, text = '') {
+  let j = null;
+  try { j = text ? JSON.parse(text) : null; } catch { j = null; }
+  const msg = j && typeof j.message === 'string' ? j.message : '';
+  if (status >= 200 && status < 300) {
+    if (j?.success === false) return { state: 'failed', why: msg || 'Destination said success: false', transient: false, rejected: true };
+    if (j?.duplicate === true || j?.already_assigned_to) {
+      return { state: 'exists', why: 'Already assigned on PackKoro' + (j.already_assigned_to ? ' (' + (j.already_assigned_to.pk_id || JSON.stringify(j.already_assigned_to)) + ')' : '') };
+    }
+    if (j && 'matched_orders' in j) {
+      const n = Number(j.matched_orders) || 0;
+      const pk = Array.isArray(j.updated_orders) ? j.updated_orders.map(o => o?.pk_id).filter(Boolean).join(', ') : '';
+      return n > 0
+        ? { state: 'forwarded', why: 'Assigned on PackKoro' + (pk ? ' → ' + pk : '') }
+        : { state: 'no_match', why: msg || 'No eligible order found for this phone number' };
+    }
+    return { state: 'forwarded', why: msg || 'Accepted by destination (HTTP ' + status + ')' };
+  }
+  if (status === 409) return { state: 'exists', why: msg || 'Already exists on destination' };
+  if (status === 404) return { state: 'no_match', why: msg || 'Destination found no matching order' };
+  if (status === 401 || status === 403) return { state: 'failed', why: 'API key rejected (HTTP ' + status + ')' + (msg ? ': ' + msg : ''), transient: false };
+  // 503 = integration switched off / no key on PackKoro: retrying in the same run is pointless.
+  if (status === 503) return { state: 'failed', why: 'Destination integration is off (HTTP 503)' + (msg ? ': ' + msg : ''), transient: false };
+  if (status === 429) return { state: 'failed', why: 'Rate limited (HTTP 429)', transient: true, wait: 15000 };
+  if (status === 408 || status >= 500) return { state: 'failed', why: 'Destination error (HTTP ' + status + ')' + (msg ? ': ' + msg : ''), transient: true };
+  return { state: 'failed', why: 'Rejected by destination (HTTP ' + status + ')' + (msg ? ': ' + msg : ''), transient: false, rejected: true };
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function postOnce(url, key, body) {
+  const t0 = Date.now();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), SEND_TIMEOUT_MS);
   try {
@@ -249,9 +275,9 @@ async function postOnce(url, key, body) {
       signal: ctrl.signal
     });
     const text = await res.text().catch(() => '');
-    return { status: res.status, text };
+    return { status: res.status, text, ms: Date.now() - t0 };
   } catch (err) {
-    return { status: null, text: ctrl.signal.aborted ? 'Timed out after ' + SEND_TIMEOUT_MS / 1000 + 's' : 'Network error: ' + (err?.message || err) };
+    return { status: null, text: ctrl.signal.aborted ? 'Timed out after ' + SEND_TIMEOUT_MS / 1000 + 's' : 'Network error: ' + (err?.message || err), ms: Date.now() - t0 };
   } finally {
     clearTimeout(timer);
   }
@@ -268,11 +294,11 @@ async function sendOne(row, settings) {
   let got = null, cls = null;
   for (let i = 0; i < IN_RUN_TRIES; i++) {
     got = await postOnce(settings.apiUrl, settings.apiKey, body);
-    cls = got.status == null ? { state: 'failed', why: got.text, transient: true } : classify(got.status);
-    d().prepare('INSERT INTO attempts (invoice_id, at, http_status, result, response) VALUES (?, ?, ?, ?, ?)')
-      .run(row.invoice_id, now(), got.status, cls.state, scrub(got.text, settings.apiKey));
+    cls = got.status == null ? { state: 'failed', why: got.text, transient: true } : classify(got.status, got.text);
+    d().prepare('INSERT INTO attempts (invoice_id, at, http_status, result, response, request_url, request_body, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(row.invoice_id, now(), got.status, cls.state, scrub(got.text, settings.apiKey), settings.apiUrl, JSON.stringify(body), got.ms ?? null);
     if (!(cls.state === 'failed' && cls.transient) || i === IN_RUN_TRIES - 1) break;
-    await sleep(1000 * 2 ** i);
+    await sleep(cls.wait || 1000 * 2 ** i);
   }
   const fin = now();
   const attempts = (d().prepare('SELECT attempts FROM invoices WHERE invoice_id = ?').get(row.invoice_id)?.attempts || 0) + 1;
@@ -322,11 +348,22 @@ export async function runSync({ trigger = 'auto' } = {}) {
       if (!settings.apiUrl || !settings.apiKey) {
         summary.error = 'Set the API URL and API key to start forwarding';
       } else {
-        const due = d().prepare(`SELECT * FROM invoices WHERE status IN ('new','failed','no_match')
-            AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY first_seen_at LIMIT 200`).all(now());
+        // No-match rows are retried only while the order is still pending in Ecom Drive (seen in this scan).
+        const due = d().prepare(`SELECT * FROM invoices WHERE (status IN ('new','failed') OR (status = 'no_match' AND last_seen_at >= ?))
+            AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY first_seen_at LIMIT 200`).all(at, now());
+        let lastSend = 0;
         for (const row of due) {
+          // PackKoro allows 60 requests/minute per IP: keep sends ~1.1s apart.
+          const gap = Date.now() - lastSend;
+          if (lastSend && gap < SEND_GAP_MS) await sleep(SEND_GAP_MS - gap);
+          lastSend = Date.now();
           const st = await sendOne(row, settings);
           summary.sent[st] = (summary.sent[st] || 0) + 1;
+          // Integration off or key rejected: stop this run instead of hitting every invoice.
+          if (st === 'failed') {
+            const r = d().prepare('SELECT last_http FROM invoices WHERE invoice_id = ?').get(row.invoice_id);
+            if ([401, 403, 503].includes(r?.last_http)) { summary.error = 'Stopped: destination returned HTTP ' + r.last_http + ' — will retry later'; break; }
+          }
         }
       }
       lastRunError = summary.error;
@@ -399,7 +436,37 @@ export function forwarderStatus({ filter = '', search = '', limit = 200 } = {}) 
 }
 
 export function attemptLog(invoiceId) {
-  return d().prepare('SELECT at, http_status, result, response FROM attempts WHERE invoice_id = ? ORDER BY id DESC LIMIT 50').all(invoiceId);
+  const s = getSettings();
+  const rows = d().prepare('SELECT at, http_status, result, response, request_url, request_body, duration_ms FROM attempts WHERE invoice_id = ? ORDER BY id DESC LIMIT 50').all(invoiceId);
+  return rows.map(r => ({ ...r, request: rawRequest(r.request_url, r.request_body, s.keyMask) }));
+}
+
+/** Raw HTTP text of a request as sent — the Authorization value is masked, never the real key. */
+function rawRequest(url, bodyJson, keyMask) {
+  if (!url || !bodyJson) return '';
+  let u;
+  try { u = new URL(url); } catch { return ''; }
+  let pretty = bodyJson;
+  try { pretty = JSON.stringify(JSON.parse(bodyJson), null, 2); } catch { /* keep */ }
+  return [
+    `POST ${u.pathname}${u.search} HTTP/1.1`,
+    `Host: ${u.host}`,
+    'Content-Type: application/json',
+    'Accept: application/json',
+    `Authorization: Bearer ${keyMask || '••••'}`,
+    `Content-Length: ${Buffer.byteLength(bodyJson)}`,
+    '',
+    pretty
+  ].join('\n');
+}
+
+/** What would be sent for this invoice right now (for invoices not sent yet). */
+export function previewRequest(invoiceId) {
+  const row = d().prepare('SELECT * FROM invoices WHERE invoice_id = ?').get(invoiceId);
+  if (!row) throw new Error('Invoice not found');
+  const s = getSettings();
+  const body = JSON.stringify(payloadOf(row));
+  return { invoice_id: invoiceId, status: row.status, request: rawRequest(s.apiUrl || 'https://(set-api-url)/', body, s.keyMask), configured: !!(s.apiUrl && s.hasKey) };
 }
 
 /** Connection check without creating anything: unauthenticated-vs-authenticated GET to the API URL. */

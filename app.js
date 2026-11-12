@@ -3309,7 +3309,7 @@ function fwdLiveHtml(st) {
       <td class="n">৳${Number(r.cod_amount || 0).toLocaleString('en-IN')}</td><td>${pill(r)}</td><td class="n">${r.attempts}</td>
       <td>${r.last_attempt_at ? dt(r.last_attempt_at) : '<span class="muted">—</span>'}${r.next_retry_at && !done(r) ? `<small class="muted">retry ${dt(r.next_retry_at)}</small>` : ''}</td>
       <td class="fwd-msg">${esc(r.last_message || '')}</td>
-      <td class="fwd-row-btns">${r.attempts ? `<button class="btn sm" data-click="fwdLog" data-id="${esc(r.invoice_id)}">Log</button>` : ''}${['failed', 'no_match', 'invalid'].includes(r.status) ? `<button class="btn sm" data-click="fwdRetryOne" data-id="${esc(r.invoice_id)}">Retry</button>` : ''}</td>
+      <td class="fwd-row-btns">${r.attempts ? `<button class="btn sm" data-click="fwdLog" data-id="${esc(r.invoice_id)}">Request</button>` : `<button class="btn sm" data-click="fwdPreview" data-id="${esc(r.invoice_id)}">Preview</button>`}${['failed', 'no_match', 'invalid'].includes(r.status) ? `<button class="btn sm" data-click="fwdRetryOne" data-id="${esc(r.invoice_id)}">Retry</button>` : ''}</td>
     </tr>`).join('');
   return `<div class="fwd-status">
       <span class="fwd-dot ${esc(c.state)}"></span><b>${esc(c.text)}</b>
@@ -3807,9 +3807,33 @@ document.addEventListener('click', async e => {
     else if (a === 'fwdLog') {
       const res = await api('/api/forwarder/log?invoice=' + encodeURIComponent(id), { timeoutMs: 15000 });
       const { attempts = [] } = await res.json().catch(() => ({}));
-      const rows = attempts.map(x => `<tr><td>${dt(x.at)}</td><td>${x.http_status ?? '—'}</td><td>${esc((FWD_STATUS[x.result] || [x.result])[0])}</td><td class="fwd-msg">${esc(x.response)}</td></tr>`).join('');
-      $('#modalBody').innerHTML = `<h3>${esc(id)} · forwarding log</h3><div class="tw"><table><tr><th>When</th><th>HTTP</th><th>Result</th><th>Destination response</th></tr>${rows || '<tr><td colspan="4" class="muted">No attempts.</td></tr>'}</table></div><p class="muted">API key কখনো লগে রাখা হয় না।</p>`;
+      const pretty = txt => { try { return JSON.stringify(JSON.parse(txt), null, 2); } catch { return txt || ''; } };
+      const items = attempts.map((x, i) => {
+        const [label, tone] = FWD_STATUS[x.result] || [x.result, ''];
+        const statusLine = x.http_status != null ? `HTTP/1.1 ${x.http_status}` : 'No HTTP response';
+        return `<details class="fwd-raw" ${i === 0 ? 'open' : ''}>
+          <summary><span class="fwd-pill ${tone}">${esc(label)}</span> <b>${x.http_status ?? '—'}</b> · ${dt(x.at)}${x.duration_ms != null ? ` · ${x.duration_ms}ms` : ''}</summary>
+          <div class="fwd-raw-grid">
+            <div><h5>Request <button class="btn sm" data-click="fwdCopy" data-target="req${i}">Copy</button></h5><pre id="req${i}">${esc(x.request || '(request not recorded for this older attempt)')}</pre></div>
+            <div><h5>Response <button class="btn sm" data-click="fwdCopy" data-target="res${i}">Copy</button></h5><pre id="res${i}">${esc(statusLine + '\n\n' + pretty(x.response))}</pre></div>
+          </div>
+        </details>`;
+      }).join('');
+      $('#modalBody').innerHTML = `<h3>${esc(id)} · raw requests</h3>${items || '<p class="muted">No attempts yet.</p>'}<p class="muted">Authorization হেডারে key-এর শুধু শেষ ৪ অক্ষর দেখানো হয় — আসল key কখনো লগে রাখা হয় না।</p>`;
       $('#modal').classList.remove('hidden');
+    }
+    else if (a === 'fwdPreview') {
+      const res = await api('/api/forwarder/preview?invoice=' + encodeURIComponent(id), { timeoutMs: 15000 });
+      const p = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(p.error || 'Preview failed');
+      $('#modalBody').innerHTML = `<h3>${esc(id)} · request preview</h3>
+        <p class="muted">${p.configured ? 'এই invoice পাঠানোর সময় ঠিক এই request যাবে।' : 'API URL / key এখনো সেট নেই — body এরকম যাবে।'}</p>
+        <div class="fwd-raw"><h5>Request <button class="btn sm" data-click="fwdCopy" data-target="reqPrev">Copy</button></h5><pre id="reqPrev">${esc(p.request)}</pre></div>`;
+      $('#modal').classList.remove('hidden');
+    }
+    else if (a === 'fwdCopy') {
+      const text = document.getElementById(b.dataset.target)?.textContent || '';
+      try { await navigator.clipboard.writeText(text); toast('Copied'); } catch { toast('Copy failed — select the text instead'); }
     }
     else if (a === 'calcToggle') {
       const name = b.dataset.name, step = (window.__calcSteps || []).find(s => s.name === name);

@@ -8,7 +8,7 @@ import { checkPathao } from './pathao.mjs';
 import { checkPassword, clearFails, createPassword, endSession, hasPassword, markFail, sessionOk, startSession, tooManyFails } from './auth.mjs';
 import { calculateStatus, startCalculate, tickSchedule } from './calculate.mjs';
 import { firestoreConfigured } from './firestore.mjs';
-import { attemptLog, forwarderStatus, retry as retryForwarder, runSync, saveSettings as saveForwarderSettings, testConnection, tickForwarder } from './forwarder.mjs';
+import { attemptLog, forwarderStatus, previewRequest, retry as retryForwarder, runSync, saveSettings as saveForwarderSettings, testConnection, tickForwarder } from './forwarder.mjs';
 
 const workerDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(workerDir, '..');
@@ -383,6 +383,10 @@ const server = http.createServer(async (req, res) => {
     try {
       if (req.method === 'GET' && url.pathname === '/api/forwarder/status') {
         json(200, forwarderStatus({ filter: url.searchParams.get('filter') || '', search: url.searchParams.get('q') || '' }));
+        return;
+      }
+      if (req.method === 'GET' && url.pathname === '/api/forwarder/preview') {
+        json(200, previewRequest(url.searchParams.get('invoice') || ''));
         return;
       }
       if (req.method === 'GET' && url.pathname === '/api/forwarder/log') {
