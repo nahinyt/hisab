@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { sub, done, note, progressRow } from './progress.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(root, '.env');
@@ -92,6 +93,7 @@ async function clerkCall(pathname, body) {
 async function passwordLogin() {
   if (!EMAIL || !PASSWORD) throw new Error('Set ECOMDRIVE_EMAIL and ECOMDRIVE_PASSWORD in worker/.env');
   console.log('signing in to EcomDrive');
+  sub('EcomDrive-এ লগইন করছি (ইমেইল + পাসওয়ার্ড)');
   const html = await fetch(BASE + '/sign-in').then(r => r.text());
   if (!/pk_(?:live|test)_/.test(html)) throw new Error('EcomDrive sign-in page did not load');
   clerkState.jar = new Map();
@@ -115,6 +117,7 @@ async function passwordLogin() {
   if (!jwt) throw new Error('EcomDrive did not return a session');
   clerkState.sessionId = session.id || attempt?.response?.created_session_id || '';
   rememberJwt(jwt);
+  done('লগইন সফল');
   return clerkState.jwt;
 }
 
@@ -126,6 +129,7 @@ async function refreshJwt() {
     if (!jwt) return '';
     rememberJwt(jwt);
     console.log('EcomDrive session reused');
+    note('আগের লগইন সেশন রিফ্রেশ হয়েছে — আবার লগইন লাগেনি');
     return clerkState.jwt;
   } catch (err) {
     const msg = String(err?.message || '');
@@ -135,7 +139,11 @@ async function refreshJwt() {
 }
 
 async function getJwt() {
-  if (clerkState.jwt && clerkState.exp - 15000 > Date.now()) return clerkState.jwt;
+  if (clerkState.jwt && clerkState.exp - 15000 > Date.now()) {
+    const row = progressRow();
+    if (row && !sessionNoted.has(row)) { sessionNoted.add(row); note('EcomDrive-এ লগইন আছে — আবার লগইন লাগেনি'); }
+    return clerkState.jwt;
+  }
   if (!signingIn) {
     signingIn = (async () => {
       const refreshed = await refreshJwt();
@@ -166,21 +174,41 @@ async function ensureBusinessId(jwt) {
   return clerkState.businessId;
 }
 
+const PAGE_LABELS = [
+  ['/products/stats', 'স্টক সামারি'],
+  ['/products', 'প্রোডাক্ট তালিকা (স্টক)'],
+  ['/suppliers', 'সাপ্লায়ার তালিকা (বাকি)'],
+  ['/payment-accounts', 'ব্যাংক / ক্যাশ অ্যাকাউন্ট'],
+  ['/reports/order-management/monthly-sales', 'অর্ডার রিপোর্ট'],
+  ['/reports/order-management/net-product-sales', 'প্রোডাক্ট সেলস রিপোর্ট'],
+  ['/finance/expense-matrix', 'খরচের হিসাব'],
+  ['/finance/courier-invoices', 'কুরিয়ার ইনভয়েস']
+];
+function pageLabel(pathname) {
+  return PAGE_LABELS.find(([p]) => pathname === p)?.[1] || pathname;
+}
+// "Signed in already" is said once per calculate step, not on every API call.
+const sessionNoted = new WeakSet();
+
 /** EcomDrive retired Node tRPC; shop data is now Go REST under /api/app/v1/businesses/{id}/… */
 async function api(pathname, query) {
   const jwt = await getJwt();
   const businessId = await ensureBusinessId(jwt);
+  sub(pageLabel(pathname));
   const qs = query && Object.keys(query).length
     ? '?' + new URLSearchParams(Object.entries(query).filter(([, v]) => v != null && v !== '')).toString()
     : '';
   const url = `${BASE}/api/app/v1/businesses/${businessId}${pathname}${qs}`;
   let res = await fetch(url, { headers: authHeaders(jwt) });
   if (res.status === 401 || res.status === 403) {
+    done('সেশনের মেয়াদ শেষ', 'warn');
+    note('আগের সেশন আর কাজ করছে না — নতুন করে লগইন করছি', 'warn');
     clerkState.jwt = '';
     clerkState.exp = 0;
     clerkState.businessId = '';
     const jwt2 = await getJwt();
     const businessId2 = await ensureBusinessId(jwt2);
+    sub(pageLabel(pathname));
     res = await fetch(`${BASE}/api/app/v1/businesses/${businessId2}${pathname}${qs}`, { headers: authHeaders(jwt2) });
   }
   const json = await res.json().catch(() => ({}));
@@ -188,6 +216,11 @@ async function api(pathname, query) {
     throw new Error(json?.error?.message || (pathname + ' HTTP ' + res.status));
   }
   return json;
+}
+
+/** Read-only GET on the business REST API (shared login/session). Used by the invoice forwarder. */
+export function ecomGet(pathname, query) {
+  return api(pathname, query);
 }
 
 async function collectCursor(pathname, mapItem, query = {}, maxPages = 40) {

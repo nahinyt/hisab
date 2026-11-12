@@ -8,6 +8,7 @@ import { checkPathao } from './pathao.mjs';
 import { checkPassword, clearFails, createPassword, endSession, hasPassword, markFail, sessionOk, startSession, tooManyFails } from './auth.mjs';
 import { calculateStatus, startCalculate, tickSchedule } from './calculate.mjs';
 import { firestoreConfigured } from './firestore.mjs';
+import { attemptLog, forwarderStatus, retry as retryForwarder, runSync, saveSettings as saveForwarderSettings, testConnection, tickForwarder } from './forwarder.mjs';
 
 const workerDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(workerDir, '..');
@@ -376,6 +377,41 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ---------- Ecom Drive → PackKoro invoice forwarder (session-gated above) ----------
+  if (url.pathname.startsWith('/api/forwarder/')) {
+    const json = (code, body) => send(res, code, JSON.stringify(body), 'application/json; charset=utf-8', origin);
+    try {
+      if (req.method === 'GET' && url.pathname === '/api/forwarder/status') {
+        json(200, forwarderStatus({ filter: url.searchParams.get('filter') || '', search: url.searchParams.get('q') || '' }));
+        return;
+      }
+      if (req.method === 'GET' && url.pathname === '/api/forwarder/log') {
+        json(200, { attempts: attemptLog(url.searchParams.get('invoice') || '') });
+        return;
+      }
+      if (req.method === 'POST') {
+        const body = JSON.parse(await readBody(req, 4000) || '{}');
+        if (url.pathname === '/api/forwarder/settings') { json(200, { settings: saveForwarderSettings(body) }); return; }
+        if (url.pathname === '/api/forwarder/sync') {
+          runSync({ trigger: 'manual' }).catch(err => console.error('forwarder sync', err.message || err));
+          json(202, { started: true });
+          return;
+        }
+        if (url.pathname === '/api/forwarder/retry') {
+          const n = retryForwarder({ invoiceId: body.invoiceId || '', which: body.which || 'failed' });
+          runSync({ trigger: 'retry' }).catch(err => console.error('forwarder retry', err.message || err));
+          json(202, { queued: n });
+          return;
+        }
+        if (url.pathname === '/api/forwarder/test') { json(200, await testConnection()); return; }
+      }
+      json(404, { error: 'Not found' });
+    } catch (err) {
+      json(400, { error: err.message || 'Forwarder error' });
+    }
+    return;
+  }
+
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     send(res, 405, JSON.stringify({ error: 'Method not allowed' }));
     return;
@@ -403,6 +439,12 @@ server.listen(PORT, HOST, () => {
     console.log('Server calculate: set FIREBASE_AUTH_EMAIL/PASSWORD (+ FIREBASE_*) for shared Live Sheet + background calc');
   }
 });
+
+// Invoice forwarder: checks every 20s whether it is enabled and its polling interval has passed.
+setInterval(() => {
+  try { tickForwarder()?.catch(err => console.error('forwarder', err.message || err)); }
+  catch (err) { console.error('forwarder', err.message || err); }
+}, 20000);
 
 // Browser-independent schedule: Settings.interval minutes → full calculate on this host.
 setInterval(() => {

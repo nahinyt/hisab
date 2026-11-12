@@ -7,7 +7,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "check": "node --check server.mjs && node --check auth.mjs && node --check ecomdrive.mjs && node --check steadfast.mjs && node --check pathao.mjs && node --check firestore.mjs && node --check calculate.mjs && node --check smoke.mjs",
+    "check": "node --check server.mjs && node --check auth.mjs && node --check ecomdrive.mjs && node --check steadfast.mjs && node --check pathao.mjs && node --check firestore.mjs && node --check calculate.mjs && node --check progress.mjs && node --check forwarder.mjs && node --check smoke.mjs",
     "test": "node smoke.mjs",
     "sync": "node ecomdrive.mjs"
   },

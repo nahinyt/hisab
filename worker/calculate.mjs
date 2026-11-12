@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { checkAccounts, checkCourierHistory, checkDollar, checkExpenses, checkReport, checkStock, checkSuppliers } from './ecomdrive.mjs';
 import { checkSteadfast } from './steadfast.mjs';
 import { checkPathao } from './pathao.mjs';
+import { withProgress, done as subDone, sub as subStart } from './progress.mjs';
 import { addDocRow, firestoreConfigured, getMainSettings, listDocs, setDocMerge } from './firestore.mjs';
 
 const TZ = 'Asia/Dhaka';
@@ -336,16 +337,21 @@ function loadSms() {
 }
 
 async function step(name, fn, steps) {
-  const row = { name, status: 'run', detail: '' };
+  const row = { name, status: 'run', detail: '', subs: [], startedAt: Date.now() };
   steps.push(row);
-  try {
-    const detail = await fn();
-    row.status = 'ok';
-    row.detail = detail || '';
-  } catch (err) {
-    row.status = 'fail';
-    row.detail = err.message || String(err);
-  }
+  await withProgress(row, async () => {
+    try {
+      const detail = await fn();
+      subDone();
+      row.status = 'ok';
+      row.detail = detail || '';
+    } catch (err) {
+      row.detail = err.message || String(err);
+      subDone(row.detail, 'fail');
+      row.status = 'fail';
+    }
+  });
+  row.ms = Date.now() - row.startedAt;
   return row;
 }
 
@@ -415,6 +421,7 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
         ['Steadfast · Unpaid amount', data.unpaidAmount, decision.count === 'open', data.openPayment?.id || '', data.openPayment?.state || ''],
         ['Steadfast · Last paid amount', data.lastPaidAmount, paidInclude, data.paidPayment?.id || '', 'paid']
       ];
+      subStart('শিটে Steadfast-এর সংখ্যা সেভ করছি');
       for (const [name, raw, include, paymentId, paymentState] of rows) {
         if (raw == null) continue;
         await saveCourier(items, name, 'Steadfast', 'steadfast', raw, include, paymentId, paymentState);
@@ -437,6 +444,7 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
         ['Pathao · Last processing', data.lastProcessing, decision.count === 'open', data.openPayment?.id || '', data.openPayment?.state || ''],
         ['Pathao · Last paid', data.lastPaidAmount, paidInclude, data.paidPayment?.id || '', 'paid']
       ];
+      subStart('শিটে Pathao-র সংখ্যা সেভ করছি');
       for (const [name, raw, include, paymentId, paymentState] of rows) {
         if (raw == null) continue;
         await saveCourier(items, name, 'Pathao', 'pathao', raw, include, paymentId, paymentState);

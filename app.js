@@ -31,12 +31,12 @@ const NAV = [
   ['overview', 'Overview'], ['sheet', 'Live Sheet'], ['actions', 'Quick Actions'], ['balance', 'Assets & Dues'],
   ['accounts', 'Accounts'], ['courier', 'Courier'], ['stock', 'Inventory'], ['metrics', 'Ecomdrive & Metrics'], ['expenses', 'Expenses'],
   ['suppliers', 'Suppliers & Dues'], ['owner', 'Owner Adjustment'], ['ledger', 'Ledger'],
-  ['daily', 'Daily Profit & Cash'], ['errors', 'Errors'], ['integrations', 'Integrations'], ['audit', 'Audit Logs'], ['settings', 'Settings']
+  ['daily', 'Daily Profit & Cash'], ['errors', 'Errors'], ['integrations', 'Integrations'], ['forwarder', 'Invoice Forwarder'], ['audit', 'Audit Logs'], ['settings', 'Settings']
 ];
 const NAV_GROUPS = [
   ['হিসাব', ['overview', 'sheet', 'actions', 'daily', 'ledger']],
   ['সম্পদ', ['balance', 'accounts', 'courier', 'stock', 'metrics', 'expenses', 'suppliers', 'owner']],
-  ['আরও', ['errors', 'integrations', 'audit', 'settings']]
+  ['আরও', ['errors', 'integrations', 'forwarder', 'audit', 'settings']]
 ];
 
 // ---------- defaults (used only to seed Firestore the first time) ----------
@@ -1811,14 +1811,54 @@ function paintCalcProgress() {
   const done = steps.filter(s => s.status === 'ok' || s.status === 'fail').length;
   const pct = Math.round((done / steps.length) * 100);
   const run = steps.find(s => s.status === 'run');
+  const runSub = run && (run.subs || []).filter(x => x.status === 'run').pop();
   const title = busy
     ? (run ? `এখন: ${run.name}` : 'হিসাব চলছে')
     : (window.__calcMsg || 'শেষ');
-  const mark = s => s.status === 'ok' ? '✓' : s.status === 'fail' ? '!' : s.status === 'run' ? '…' : '';
+  const subtitle = busy && runSub ? runSub.label + (runSub.hint ? ' · ' + runSub.hint : '') : '';
+  const seen = window.__calcSeen || (window.__calcSeen = new Set());
+  const open = window.__calcOpen || (window.__calcOpen = {});
+  const secs = ms => ms == null ? '' : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)}s`;
+  const icon = st => st === 'ok' ? '✓' : st === 'fail' ? '!' : st === 'warn' ? '!' : st === 'info' ? 'i' : st === 'run' ? '' : '';
+  const subHtml = (s, x, i) => {
+    const key = s.name + '|' + i + '|' + x.label;
+    const fresh = !seen.has(key);
+    seen.add(key);
+    const extra = x.status === 'run' ? (x.hint || '') : (x.note || '');
+    return `<li class="cs ${esc(x.status)}${fresh ? ' enter' : ''}" style="--d:${fresh ? Math.min(i, 4) * 40 : 0}ms"><span class="cs-dot">${icon(x.status)}</span><span class="cs-lab">${esc(x.label)}${x.count > 1 ? ` <em>×${x.count}</em>` : ''}${extra ? `<small>${esc(extra)}</small>` : ''}</span>${x.status !== 'run' && x.ms != null ? `<span class="cs-ms">${secs(x.ms)}</span>` : ''}</li>`;
+  };
+  const lastStatus = window.__calcStatus || (window.__calcStatus = {});
+  const stepHtml = s => {
+    const subs = s.subs || [];
+    const justDone = (s.status === 'ok' || s.status === 'fail') && lastStatus[s.name] && lastStatus[s.name] !== s.status;
+    lastStatus[s.name] = s.status;
+    const auto = s.status === 'run' || s.status === 'fail';
+    const isOpen = subs.length && (open[s.name] ?? auto);
+    const elapsed = s.status === 'run' && s.startedAt ? secs(Date.now() - s.startedAt) : secs(s.ms);
+    return `<li class="${esc(s.status)}${isOpen ? ' open' : ''}${justDone ? ' justdone' : ''}">
+      <button type="button" class="calc-row" ${subs.length ? `data-click="calcToggle" data-name="${esc(s.name)}" aria-expanded="${isOpen ? 'true' : 'false'}"` : 'disabled'}>
+        <span class="mark">${s.status === 'ok' ? '✓' : s.status === 'fail' ? '!' : ''}</span>
+        <span class="lab">${esc(s.name)}${s.detail && s.detail !== 'ok' ? `<small>${esc(s.detail)}</small>` : ''}</span>
+        ${elapsed ? `<span class="calc-ms">${elapsed}</span>` : ''}
+        ${subs.length ? `<span class="chev" aria-hidden="true"></span>` : ''}
+      </button>
+      ${isOpen ? `<ol class="calc-subs">${subs.map((x, i) => subHtml(s, x, i)).join('')}</ol>` : ''}
+    </li>`;
+  };
+  const list = el.querySelector('.calc-steps');
+  const keepScroll = list ? list.scrollTop : 0;
   el.classList.remove('hidden');
-  el.innerHTML = `<h4><span class="calc-pct">${pct}%</span>${esc(title)}</h4>
+  el.classList.toggle('busy', busy);
+  // Redraws replace the DOM; negative delays keep looping animations in phase instead of restarting.
+  const now = Date.now();
+  el.style.setProperty('--ph8', `-${now % 800}ms`);
+  el.style.setProperty('--ph12', `-${now % 1200}ms`);
+  el.style.setProperty('--ph14', `-${now % 1400}ms`);
+  el.innerHTML = `<div class="calc-head"><h4><span class="calc-pct">${pct}%</span>${esc(title)}</h4>${subtitle ? `<p class="calc-now">${esc(subtitle)}</p>` : ''}</div>
     <div class="calc-bar" aria-hidden="true"><i style="width:${pct}%"></i></div>
-    <ul class="calc-steps">${steps.map(s => `<li class="${esc(s.status)}"><span class="mark">${mark(s)}</span><span class="lab">${esc(s.name)}${s.detail ? `<small>${esc(s.detail)}</small>` : ''}</span></li>`).join('')}</ul>`;
+    <ul class="calc-steps">${steps.map(stepHtml).join('')}</ul>`;
+  const next = el.querySelector('.calc-steps');
+  if (next) next.scrollTop = keepScroll;
 }
 async function calculateNow(manual) {
   if (window.__calcBusy) {
@@ -1867,6 +1907,9 @@ async function calculateNow(manual) {
   window.__cloudDown = false;
   window.__cloudErr = '';
   window.__calcSteps = jobNames.map(name => ({ name, status: 'pending', detail: '' }));
+  window.__calcSeen = new Set();
+  window.__calcOpen = {};
+  window.__calcStatus = {};
   window.__calcMsg = 'Production server is checking every source…';
   const pulse = setInterval(writeLock, 15000);
   paintCalcProgress();
@@ -1900,7 +1943,7 @@ async function calculateNow(manual) {
     const deadline = Date.now() + 12 * 60000;
     let final = data;
     while (Date.now() < deadline) {
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 1200));
       const st = await api('/api/calculate/status', { timeoutMs: 15000 });
       const body = await st.json().catch(() => ({}));
       if (st.status === 401 || isSignInRequired(body.error)) {
@@ -1914,7 +1957,7 @@ async function calculateNow(manual) {
         window.__calcSteps = jobNames.map(name => {
           const hit = steps.find(s => s.name === name);
           return hit
-            ? { name, status: hit.status || 'pending', detail: hit.detail || '' }
+            ? { name, status: hit.status || 'pending', detail: hit.detail || '', subs: hit.subs || [], ms: hit.ms, startedAt: hit.startedAt }
             : { name, status: body.busy ? 'pending' : 'ok', detail: '' };
         });
         const running = steps.find(s => s.status === 'run');
@@ -1929,7 +1972,7 @@ async function calculateNow(manual) {
     const steps = Array.isArray(final.steps) ? final.steps : (final.lastRun?.steps || []);
     window.__calcSteps = jobNames.map(name => {
       const hit = steps.find(s => s.name === name);
-      return hit ? { name, status: hit.status || 'ok', detail: hit.detail || '' } : { name, status: 'ok', detail: 'server' };
+      return hit ? { name, status: hit.status || 'ok', detail: hit.detail || '', subs: hit.subs || [], ms: hit.ms } : { name, status: 'ok', detail: 'server' };
     });
     if (final.lastRun?.error) throw new Error(final.lastRun.error);
     // Local fallback when Firestore quota blocks cloud writes — apply server row into this browser.
@@ -3209,6 +3252,117 @@ function itemStatement(id) {
     <p class="muted">Live Sheet-এর পরপর দুই সারির তুলনা থেকে বানানো। ${isLiab ? 'বাকি কমার সময় কোনো ব্যাংক/ক্যাশ ঘরে প্রায় সমান টাকা (৳১০ বা ২% পর্যন্ত) কমলে সেটাকে শোধ ধরা হয়েছে।' : 'টাকা কমার সময় কোনো সাপ্লায়ারের বাকি প্রায় সমান (৳১০ বা ২% পর্যন্ত) কমলে সেটাকে শোধ ধরা হয়েছে।'}</p>`;
 }
 
+// ---------- Invoice forwarder (Ecom Drive → PackKoro) ----------
+const FWD_STATUS = {
+  new: ['Queued', 'pending'], sending: ['Sending', 'pending'], forwarded: ['Forwarded', 'ok'], exists: ['Already on PackKoro', 'ok'],
+  no_match: ['No matching order', 'warn'], failed: ['Failed', 'fail'], invalid: ['Invalid data', 'fail']
+};
+function fwdEnsurePolling() {
+  if (window.__fwdTimer) return;
+  window.__fwdTimer = setInterval(() => {
+    if (page !== 'forwarder') { clearInterval(window.__fwdTimer); window.__fwdTimer = null; return; }
+    fwdLoad();
+  }, 5000);
+  fwdLoad();
+}
+async function fwdLoad() {
+  try {
+    const q = new URLSearchParams({ filter: window.__fwdFilter || '', q: window.__fwdQ || '' });
+    const res = await api('/api/forwarder/status?' + q, { timeoutMs: 15000 });
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 401) { demandHisabLogin(!!body.setup, 'Invoice Forwarder-এর জন্য সাইন-ইন লাগবে।'); return; }
+    if (!res.ok) throw new Error(body.error || 'Could not load forwarder');
+    const first = !window.__fwd;
+    window.__fwd = body;
+    if (page !== 'forwarder') return;
+    if (first) render(true);
+    else {
+      const live = $('#fwdLive');
+      if (live) live.innerHTML = fwdLiveHtml(body);
+      fwdPaintButtons(body);
+    }
+  } catch (err) {
+    const live = $('#fwdLive');
+    if (live && !live.querySelector('.fwd-loaderr')) live.insertAdjacentHTML('afterbegin', `<div class="card err fwd-loaderr">${esc(err.message)}</div>`);
+  }
+}
+function fwdPaintButtons(st) {
+  const sync = document.querySelector('[data-click="fwdSync"]');
+  if (sync) { sync.disabled = st.running; sync.textContent = st.running ? 'Syncing…' : 'Sync now'; }
+  const tog = document.querySelector('[data-click="fwdToggle"]');
+  if (tog) { tog.textContent = st.settings.enabled ? 'Stop automation' : 'Start automation'; tog.className = 'btn ' + (st.settings.enabled ? 'danger' : 'primary'); }
+  document.querySelector('.fwd-switch')?.classList.toggle('on', st.settings.enabled);
+}
+function fwdLiveHtml(st) {
+  const k = st.stats, c = st.connection, s = st.settings, lr = st.lastRun;
+  const tile = (label, v, cls = '', hint = '') => `<div class="fwd-tile ${cls}"><span>${label}</span><b>${v}</b>${hint ? `<small>${hint}</small>` : ''}</div>`;
+  const filters = [['', 'All'], ['new', 'Queued'], ['done', 'Forwarded'], ['failed', 'Failed'], ['no_match', 'No match'], ['invalid', 'Invalid']];
+  const f = window.__fwdFilter || '';
+  const pill = r => { const [label, tone] = FWD_STATUS[r.status] || [r.status, '']; return `<span class="fwd-pill ${tone}">${esc(label)}</span>`; };
+  const sentBits = lr ? Object.entries(lr.sent || {}).map(([x, n]) => ` · ${n} ${esc(((FWD_STATUS[x] || [x])[0]).toLowerCase())}`).join('') : '';
+  const lastRunText = lr
+    ? `${dt(lr.finished || lr.started)} · ${lr.fetched} pending orders · ${lr.newIds} new${sentBits}${lr.error ? ` · <b class="neg">${esc(lr.error)}</b>` : ''}`
+    : 'Never';
+  const done = r => ['forwarded', 'exists'].includes(r.status);
+  const rows = st.rows.map(r => `<tr>
+      <td><b>${esc(r.invoice_id)}</b></td><td>${esc(r.phone)}</td><td>${esc(r.name)}</td><td>${esc(r.courier)}</td>
+      <td class="n">৳${Number(r.cod_amount || 0).toLocaleString('en-IN')}</td><td>${pill(r)}</td><td class="n">${r.attempts}</td>
+      <td>${r.last_attempt_at ? dt(r.last_attempt_at) : '<span class="muted">—</span>'}${r.next_retry_at && !done(r) ? `<small class="muted">retry ${dt(r.next_retry_at)}</small>` : ''}</td>
+      <td class="fwd-msg">${esc(r.last_message || '')}</td>
+      <td class="fwd-row-btns">${r.attempts ? `<button class="btn sm" data-click="fwdLog" data-id="${esc(r.invoice_id)}">Log</button>` : ''}${['failed', 'no_match', 'invalid'].includes(r.status) ? `<button class="btn sm" data-click="fwdRetryOne" data-id="${esc(r.invoice_id)}">Retry</button>` : ''}</td>
+    </tr>`).join('');
+  return `<div class="fwd-status">
+      <span class="fwd-dot ${esc(c.state)}"></span><b>${esc(c.text)}</b>
+      <span class="muted">· Automation ${s.enabled ? `<b class="pos">ON</b> every ${s.intervalMin} min` : '<b>OFF</b>'}${st.running ? ' · <b>syncing now…</b>' : ''}</span>
+    </div>
+    <p class="muted fwd-lastrun">Last run: ${lastRunText}</p>
+    <div class="fwd-tiles">
+      ${tile('Orders discovered', k.ordersDiscovered, '', 'all scans, total')}
+      ${tile('Unique invoice IDs', k.uniqueInvoices)}
+      ${tile('Forwarded', k.forwarded, 'ok', 'incl. already on PackKoro')}
+      ${tile('Pending', k.pending, 'pending', 'queued to send')}
+      ${tile('Failed', k.failed, 'fail', `${k.failedAttempts} failed attempts`)}
+      ${tile('No match', k.noMatch, 'warn', `retried every ${s.noMatchRetryMin} min`)}
+      ${tile('Duplicates skipped', k.duplicatesSkipped, '', 'already forwarded, not sent again')}
+      ${tile('Last sync', k.lastSyncAt ? dt(k.lastSyncAt) : '—', 'date')}
+      ${tile('Last success', k.lastSuccessAt ? dt(k.lastSuccessAt) : '—', 'date')}
+    </div>
+    <div class="card">
+      <div class="fwd-bar">
+        <div class="fwd-filters">${filters.map(([v, l]) => `<button class="btn sm ${f === v ? 'on' : ''}" data-click="fwdFilter" data-f="${v}">${l}</button>`).join('')}</div>
+        <div class="fwd-actions">
+          <button class="btn sm" data-click="fwdRetry" data-which="failed" ${k.failed ? '' : 'disabled'}>Retry failed (${k.failed})</button>
+          <button class="btn sm" data-click="fwdRetry" data-which="no_match" ${k.noMatch ? '' : 'disabled'}>Retry no-match (${k.noMatch})</button>
+        </div>
+      </div>
+      <div class="tw"><table class="fwd-table"><tr><th>Invoice ID</th><th>Phone</th><th>Name</th><th>Courier</th><th class="n">COD</th><th>Status</th><th class="n">Tries</th><th>Last attempt</th><th>Response</th><th></th></tr>
+      ${rows || '<tr><td colspan="10" class="muted">No invoices yet. Press “Sync now”.</td></tr>'}
+      </table></div>
+    </div>`;
+}
+async function fwdPost(path, body) {
+  const res = await api(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}), timeoutMs: 20000 });
+  const data = await res.json().catch(() => ({}));
+  if (res.status === 401) { demandHisabLogin(!!data.setup, 'Invoice Forwarder-এর জন্য সাইন-ইন লাগবে।'); throw new Error('Sign in required'); }
+  if (!res.ok) throw new Error(data.error || 'Request failed');
+  return data;
+}
+// Own submit handler (capture phase) so the generic data-form handler never sees this form.
+document.addEventListener('submit', async e => {
+  const f = e.target.closest('[data-fwd-form]'); if (!f) return;
+  e.preventDefault(); e.stopImmediatePropagation();
+  const fd = new FormData(f);
+  const patch = { apiUrl: fd.get('apiUrl'), intervalMin: fd.get('intervalMin'), noMatchRetryMin: fd.get('noMatchRetryMin') };
+  if (String(fd.get('apiKey') || '').trim()) patch.apiKey = fd.get('apiKey');
+  try {
+    await fwdPost('/api/forwarder/settings', patch);
+    f.querySelector('[name="apiKey"]').value = '';
+    toast('Forwarder settings saved');
+    window.__fwd = null;
+    await fwdLoad();
+  } catch (err) { toast(err.message); }
+}, true);
+
 const VIEWS = {
   overview() {
     const { cards, t } = kpiData();
@@ -3290,6 +3444,31 @@ const VIEWS = {
       <button class="btn primary" data-click="calculateNow" ${window.__calcBusy ? 'disabled' : ''}>${esc(calcBtnLabel())}</button>
       ${window.__calcMsg ? `<p class="muted">${esc(window.__calcMsg)}</p>` : ''}</div>
       <div class="tw"><table><tr><th>Source</th><th>Problem</th><th>When</th></tr>${list.map(e => `<tr><td>${esc(e.name)}</td><td>${esc(e.message)}</td><td>${dt(e.at)}</td></tr>`).join('') || '<tr><td colspan="3" class="muted">No errors. The last checks completed.</td></tr>'}</table></div>`;
+  },
+
+  forwarder() {
+    fwdEnsurePolling();
+    const st = window.__fwd;
+    if (!st) return '<div class="card"><p class="muted">Loading invoice forwarder…</p></div>';
+    const s = st.settings;
+    return `<div class="fwd-switch ${s.enabled ? 'on' : ''}">
+        <div><h3>Ecom Drive → PackKoro</h3><p class="muted">Pending orders থেকে invoice ID নিয়ে PackKoro Invoice API-তে পাঠায়। একবার সফল হলে সেই invoice আর কখনো পাঠানো হয় না।</p></div>
+        <div class="fwd-actions">
+          <button class="btn ${s.enabled ? 'danger' : 'primary'}" data-click="fwdToggle">${s.enabled ? 'Stop automation' : 'Start automation'}</button>
+          <button class="btn" data-click="fwdSync" ${st.running ? 'disabled' : ''}>${st.running ? 'Syncing…' : 'Sync now'}</button>
+        </div>
+      </div>
+    <div id="fwdLive">${fwdLiveHtml(st)}</div>
+    <div class="card fwd-cfg"><h3>Settings</h3>
+      <form class="form" data-fwd-form="cfg">
+        <label>Destination API URL<input name="apiUrl" type="url" required placeholder="https://packkoro.com/api/ecomdrive/invoice" value="${esc(s.apiUrl)}"></label>
+        <label>API key <small class="muted">${s.hasKey ? 'saved ' + esc(s.keyMask) + ' — leave empty to keep' : 'not set'}</small><input name="apiKey" type="password" autocomplete="new-password" placeholder="${s.hasKey ? '••••••••' : 'Bearer token'}"></label>
+        <label>Polling interval (minutes)<input name="intervalMin" type="number" min="1" max="1440" value="${s.intervalMin}"></label>
+        <label>No-match retry after (minutes)<input name="noMatchRetryMin" type="number" min="5" max="10080" value="${s.noMatchRetryMin}"></label>
+        <div class="fwd-form-btns"><button class="btn primary">Save settings</button> <button type="button" class="btn" data-click="fwdTest">Test connection</button></div>
+      </form>
+      <p class="muted">API key সার্ভারে থাকে, ব্রাউজারে ফেরত আসে না। পাঠানো হয় <code>Authorization: Bearer …</code> হেডারে। Body হুবহু: <code>{"phone","name","address","cod_amount","invoice_id"}</code>।</p>
+    </div>`;
   },
 
   balance() {
@@ -3614,6 +3793,31 @@ document.addEventListener('click', async e => {
   try {
     if (a === 'navgroup') { window.__navGroup = window.__navGroup === b.dataset.g ? '' : b.dataset.g; render(true); }
     else if (a === 'kpi') { $('#modalBody').innerHTML = breakdown(b.dataset.k); $('#modal').classList.remove('hidden'); }
+    else if (a === 'fwdSync') { await fwdPost('/api/forwarder/sync'); toast('Sync started'); setTimeout(fwdLoad, 800); }
+    else if (a === 'fwdToggle') {
+      const on = !window.__fwd?.settings?.enabled;
+      await fwdPost('/api/forwarder/settings', { enabled: on });
+      toast(on ? 'Automation started' : 'Automation stopped');
+      await fwdLoad();
+    }
+    else if (a === 'fwdRetry') { const r = await fwdPost('/api/forwarder/retry', { which: b.dataset.which }); toast(r.queued + ' invoice(s) queued for retry'); setTimeout(fwdLoad, 800); }
+    else if (a === 'fwdRetryOne') { await fwdPost('/api/forwarder/retry', { invoiceId: id }); toast(id + ' queued for retry'); setTimeout(fwdLoad, 800); }
+    else if (a === 'fwdFilter') { window.__fwdFilter = b.dataset.f; await fwdLoad(); }
+    else if (a === 'fwdTest') { const r = await fwdPost('/api/forwarder/test'); toast(r.text); }
+    else if (a === 'fwdLog') {
+      const res = await api('/api/forwarder/log?invoice=' + encodeURIComponent(id), { timeoutMs: 15000 });
+      const { attempts = [] } = await res.json().catch(() => ({}));
+      const rows = attempts.map(x => `<tr><td>${dt(x.at)}</td><td>${x.http_status ?? '—'}</td><td>${esc((FWD_STATUS[x.result] || [x.result])[0])}</td><td class="fwd-msg">${esc(x.response)}</td></tr>`).join('');
+      $('#modalBody').innerHTML = `<h3>${esc(id)} · forwarding log</h3><div class="tw"><table><tr><th>When</th><th>HTTP</th><th>Result</th><th>Destination response</th></tr>${rows || '<tr><td colspan="4" class="muted">No attempts.</td></tr>'}</table></div><p class="muted">API key কখনো লগে রাখা হয় না।</p>`;
+      $('#modal').classList.remove('hidden');
+    }
+    else if (a === 'calcToggle') {
+      const name = b.dataset.name, step = (window.__calcSteps || []).find(s => s.name === name);
+      const open = window.__calcOpen || (window.__calcOpen = {});
+      const auto = step && (step.status === 'run' || step.status === 'fail');
+      open[name] = !(open[name] ?? auto);
+      paintCalcProgress();
+    }
     else if (a === 'stmt') { $('#modalBody').innerHTML = itemStatement(id); $('#modal').classList.remove('hidden'); $('#modal .modal-box')?.scrollTo?.(0, 0); }
     else if (a === 'closeModal') $('#modal').classList.add('hidden');
     else if (a === 'snapNow' || a === 'calculateNow') await calculateNow(true);

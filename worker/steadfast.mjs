@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { sub, done, note, hint } from './progress.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(root, '.env');
@@ -18,7 +19,7 @@ const EMAIL = process.env.STEADFAST_EMAIL || '';
 const PASSWORD = process.env.STEADFAST_PASSWORD || '';
 const BASE = 'https://steadfast.com.bd';
 const STEP_MS = 25000;
-const TOTAL_MS = 70000;
+const TOTAL_MS = 100000;
 const SESSION_FILE = path.join(root, '.steadfast-session.json');
 const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -82,8 +83,20 @@ function loadSavedJar() {
   }
 }
 
-/** Fetch + body with a hard deadline (AbortSignal alone does not cover stalled body reads). */
+/** Steadfast is sometimes slow for one request; retry a timed-out read once while the overall budget lasts. */
 async function fetchText(url, opts = {}, ms = STEP_MS, label = 'Steadfast') {
+  try {
+    return await fetchTextOnce(url, opts, ms, label);
+  } catch (err) {
+    if (!/ timed out$/.test(err?.message || '') || opts.signal?.aborted) throw err;
+    console.warn(label + ' slow — retrying once');
+    hint('ধীর উত্তর দিচ্ছে — আবার চেষ্টা করছি…');
+    return fetchTextOnce(url, opts, ms, label);
+  }
+}
+
+/** Fetch + body with a hard deadline (AbortSignal alone does not cover stalled body reads). */
+async function fetchTextOnce(url, opts = {}, ms = STEP_MS, label = 'Steadfast') {
   const ctrl = new AbortController();
   const parent = opts.signal;
   const onParent = () => ctrl.abort();
@@ -190,9 +203,14 @@ async function signIn(signal) {
 async function pullStats(force, signal) {
   if (!force) restoreActive();
   const reused = !force && !!active;
-  if (reused) console.log('Steadfast session reused (skip password login)');
-  else if (!force) console.log('Steadfast has no saved session — logging in');
+  if (reused) {
+    console.log('Steadfast session reused (skip password login)');
+    note('আগের লগইন সেশন আছে — আবার লগইন লাগেনি');
+  } else if (!force) console.log('Steadfast has no saved session — logging in');
+  if (!reused) sub('Steadfast-এ লগইন করছি (ইমেইল + পাসওয়ার্ড)');
   const { take, headers, jar } = reused ? active : await signIn(signal);
+  if (!reused) done('লগইন সফল');
+  sub('Stats পেজ খুলছি');
   const stats = await fetchText(BASE + '/user/stats', {
     headers: headers({ referer: BASE + '/login' }),
     redirect: 'manual',
@@ -215,7 +233,9 @@ async function pullStats(force, signal) {
     throw new Error('Steadfast stats page did not load');
   }
   saveSession(jar);
+  done();
 
+  sub('Balance দেখছি');
   const bal = await fetchJson(BASE + '/user/check-balance', {
     headers: headers({
       accept: 'application/json',
@@ -231,7 +251,9 @@ async function pullStats(force, signal) {
     if (reused) { dropSession(); throw new Error('SESSION'); }
     throw new Error('Steadfast did not return a balance');
   }
+  done('৳' + balance);
 
+  sub('পার্সেল সামারি (In review, On the way)');
   const today = dkDate();
   const body = new FormData();
   body.append('from_date', '2015-01-01 00:00:00');
@@ -255,7 +277,9 @@ async function pullStats(force, signal) {
     if (reused) { dropSession(); throw new Error('SESSION'); }
     throw new Error('Steadfast did not return the parcel summary');
   }
+  done(`In review ৳${awaiting} · On the way ৳${onTheWay}`);
 
+  sub('Payments পেজ (শেষ পেমেন্ট)');
   const pay = await fetchText(BASE + '/user/payments', {
     headers: headers({ referer: BASE + '/user/stats' }),
     redirect: 'manual',
@@ -271,7 +295,18 @@ async function pullStats(force, signal) {
   const openRow = rows.find(r => /unpaid|processing/i.test(r.status));
   const paidRow = rows.find(r => /^paid$/i.test(r.status));
   if (!paidRow && !openRow) throw new Error('Steadfast did not return the last payment');
-  const delivery = await approvalDelivery(headers, take, reused, signal);
+  done([paidRow ? `Last paid ৳${paidRow.receive}` : '', openRow ? `Unpaid ৳${openRow.receive}` : ''].filter(Boolean).join(' · '));
+  // Approval charge is a side figure across many slow pages. If it fails, keep balance/summary/payments
+  // from this run; null charge = calculate keeps the previous charge instead of dropping all of Steadfast.
+  let delivery = { approvalDeliveryCharge: null, approvalDeliveryCount: null };
+  try {
+    delivery = await approvalDelivery(headers, take, reused, signal);
+  } catch (err) {
+    if (err?.message === 'SESSION') throw err;
+    console.warn('Steadfast approval charge skipped this run:', err?.message || err);
+    done(err?.message || 'ব্যর্থ', 'warn');
+    note('Approval charge এবার বাদ — আগের মান থাকবে, বাকি সব আপডেট হবে', 'warn');
+  }
   saveSession(jar);
 
   return {
@@ -304,6 +339,7 @@ async function approvalDelivery(headers, take, reused, signal) {
   while (page <= 40) {
     if (signal?.aborted) throw new Error('Steadfast timed out');
     const url = BASE + '/user/consignment/status/approval' + (page === 1 ? '' : '?page=' + page);
+    sub(`Approval পেজ ${page} (ডেলিভারি চার্জ)`);
     const got = await fetchText(url, {
       headers: headers({ referer: BASE + '/user/consignment/status/approval' }),
       redirect: 'manual',
@@ -332,11 +368,14 @@ async function approvalDelivery(headers, take, reused, signal) {
       count += 1;
       added += 1;
     }
+    done(added ? `${added}টা পার্সেল` : 'আর পার্সেল নেই');
     if (!added) break;
     const next = html.includes('rel="next"') || html.includes('page=' + (page + 1));
     if (!next) break;
     page += 1;
   }
+  done();
+  note(`মোট approval চার্জ ৳${money(minor / 100)} · ${count}টা পার্সেল`);
   return { approvalDeliveryCharge: money(minor / 100), approvalDeliveryCount: count };
 }
 
@@ -350,6 +389,8 @@ async function runStats(signal) {
   } catch (err) {
     if (err.message !== 'SESSION') throw err;
     console.log('Steadfast session expired — password login once, then continue');
+    done('সেশনের মেয়াদ শেষ', 'warn');
+    note('আগের সেশন আর কাজ করছে না — নতুন করে লগইন করছি', 'warn');
     const out = await pullStats(true, signal);
     console.log('Steadfast stats ok after re-login in', Date.now() - t0, 'ms');
     return out;

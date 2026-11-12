@@ -16,3 +16,5 @@ Caddyfile.local
 agent-transcripts
 **/_probe-*
 **/_ecom_js
+worker/forwarder.db
+worker/forwarder.db-*

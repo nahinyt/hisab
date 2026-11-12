@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { sub, done, note } from './progress.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const envPath = path.join(root, '.env');
@@ -86,30 +87,42 @@ let savedToken = '';
 async function token() {
   if (savedToken) return savedToken;
   console.log('signing in to Pathao');
+  sub('Pathao-তে লগইন করছি (ইমেইল + পাসওয়ার্ড)');
   savedToken = await login();
+  done('লগইন সফল');
   return savedToken;
 }
 
-async function call(pathname) {
+async function call(pathname, label) {
   try {
-    return await api(await token(), pathname);
+    const tok = await token();
+    sub(label);
+    return await api(tok, pathname);
   } catch (err) {
     if (err.message !== 'Pathao asked to sign in again') throw err;
+    done('সেশনের মেয়াদ শেষ', 'warn');
+    note('আগের সেশন আর কাজ করছে না — নতুন করে লগইন করছি', 'warn');
     savedToken = '';
-    return await api(await token(), pathname);
+    const tok = await token();
+    sub(label);
+    return await api(tok, pathname);
   }
 }
 
 async function runPathao() {
   console.log('checking Pathao courier');
-  if (savedToken) console.log('Pathao session reused');
-  const summaryJson = await call('/api/v1/monetary/merchant/invoice-summary');
+  if (savedToken) {
+    console.log('Pathao session reused');
+    note('আগের লগইন সেশন আছে — আবার লগইন লাগেনি');
+  }
+  const summaryJson = await call('/api/v1/monetary/merchant/invoice-summary', 'ইনভয়েস সামারি (Balance, In review)');
   const summary = summaryJson?.data || {};
   const upcoming = money(Math.max(Number(summary.payment_preparing_for_invoice) || 0, 0));
   const inReview = money(summary.payment_in_review || 0);
   if (upcoming == null || inReview == null) throw new Error('Pathao did not return the invoice summary');
+  done(`Balance ৳${upcoming} · In review ৳${inReview}`);
 
-  const list = rowsOf(await call('/api/v1/monetary/invoices/list?page=1&per_page=20')).map(r => ({
+  const list = rowsOf(await call('/api/v1/monetary/invoices/list?page=1&per_page=20', 'ইনভয়েস তালিকা (শেষ পেমেন্ট)')).map(r => ({
     id: String(r.invoice_id || r.id || ''),
     amount: rowAmount(r),
     state: rowState(r),
@@ -117,6 +130,7 @@ async function runPathao() {
   })).filter(r => r.id && r.amount != null);
   const open = list.find(r => r.state === 'processing' || r.state === 'unpaid') || null;
   const paid = list.find(r => r.state === 'paid' && r.id !== open?.id) || null;
+  done([paid ? `Last paid ৳${paid.amount}` : '', open ? `Processing ৳${open.amount}` : ''].filter(Boolean).join(' · '));
 
   return {
     source: BASE + '/courier/invoices/list',
