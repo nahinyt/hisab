@@ -4,6 +4,8 @@ worker/.env
 worker/auth.json
 worker/.steadfast-session.json
 worker/sms-balances.json
+worker/local-cache.json
+worker/local-sheet.json
 worker/session/
 worker/out/
 worker/node_modules/

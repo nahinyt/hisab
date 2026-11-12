@@ -121,8 +121,10 @@ function mergeSettingsRow(cloud, local) {
   }
   const stamps = [cloud.lastCalcAt, local.lastCalcAt].filter(Boolean);
   if (stamps.length) out.lastCalcAt = stamps.slice().sort((a, b) => (Date.parse(a) || 0) - (Date.parse(b) || 0)).pop();
-  if (cloud.syncErrors) out.syncErrors = cloud.syncErrors;
-  else if (local.syncErrors) out.syncErrors = local.syncErrors;
+  // Prefer cloud whenever it has the field (including []) so a successful server calc
+  // can clear Errors; do not keep stale localStorage Sign-in failures.
+  if (Array.isArray(cloud.syncErrors)) out.syncErrors = cloud.syncErrors;
+  else if (Array.isArray(local.syncErrors)) out.syncErrors = local.syncErrors;
   out.updatedAt = ct >= lt ? (cloud.updatedAt || local.updatedAt) : (local.updatedAt || cloud.updatedAt);
   return out;
 }
@@ -1829,6 +1831,8 @@ async function calculateNow(manual) {
       return;
     }
   }
+  const sess = await ensureHisabSession();
+  if (!sess.ok) return;
   if (calcBusyElsewhere()) {
     if (manual) {
       // Hung/other tab left a lock; manual click takes over.
@@ -1879,6 +1883,10 @@ async function calculateNow(manual) {
       timeoutMs: 30000
     });
     const data = await res.json().catch(() => ({}));
+    if (res.status === 401 || isSignInRequired(data.error)) {
+      demandHisabLogin(!!data.setup, 'Calculate API-র জন্য সাইন-ইন লাগবে।');
+      return;
+    }
     if (res.status === 409 && !data.busy && !data.started) {
       throw new Error(data.error || 'Server rejected calculate');
     }
@@ -1895,6 +1903,10 @@ async function calculateNow(manual) {
       await new Promise(r => setTimeout(r, 2000));
       const st = await api('/api/calculate/status', { timeoutMs: 15000 });
       const body = await st.json().catch(() => ({}));
+      if (st.status === 401 || isSignInRequired(body.error)) {
+        demandHisabLogin(!!body.setup, 'Calculate API-র জন্য সাইন-ইন লাগবে।');
+        return;
+      }
       if (!st.ok) throw new Error(body.error || 'Could not read calculate status');
       final = body;
       const steps = Array.isArray(body.steps) ? body.steps : [];
@@ -1920,12 +1932,44 @@ async function calculateNow(manual) {
       return hit ? { name, status: hit.status || 'ok', detail: hit.detail || '' } : { name, status: 'ok', detail: 'server' };
     });
     if (final.lastRun?.error) throw new Error(final.lastRun.error);
+    // Local fallback when Firestore quota blocks cloud writes — apply server row into this browser.
+    const lr = final.lastRun || final;
+    if (lr.sheetRow?.id) {
+      const row = lr.sheetRow;
+      const i = S.snapshots.findIndex(s => s.id === row.id);
+      if (i >= 0) S.snapshots[i] = { ...S.snapshots[i], ...row };
+      else S.snapshots.push(row);
+      persistSnapshotMirror(S.snapshots);
+    }
+    if (Array.isArray(lr.items) && lr.items.length) {
+      for (const patch of lr.items) {
+        if (!patch?.id) continue;
+        const hit = S.items.find(x => x.id === patch.id);
+        if (hit) Object.assign(hit, patch);
+        else S.items.push(patch);
+        mirrorLocal('items', patch.id, patch);
+      }
+    }
+    if (lr.lastCalcAt || Array.isArray(lr.syncErrors)) {
+      let main = S.settings.find(x => x.id === 'main');
+      if (!main) { main = { id: 'main' }; S.settings.push(main); }
+      if (lr.lastCalcAt) main.lastCalcAt = lr.lastCalcAt;
+      if (Array.isArray(lr.syncErrors)) main.syncErrors = lr.syncErrors;
+      main.updatedAt = lr.lastCalcAt || new Date().toISOString();
+      mirrorLocal('settings', 'main', { lastCalcAt: main.lastCalcAt, syncErrors: main.syncErrors, updatedAt: main.updatedAt });
+    }
     const failed = steps.filter(s => s.status === 'fail');
     window.__calcMsg = failed.length
       ? 'Server finished. Some checks failed; Live Sheet still updated from what succeeded.'
-      : 'Server saved fresh numbers to Firestore — every browser will see the same Live Sheet.';
+      : (lr.localFallback
+        ? 'Calculated on this server — Firestore quota blocked cloud save; numbers are on this device for now.'
+        : 'Server saved fresh numbers to Firestore — every browser will see the same Live Sheet.');
     if (manual) toast(window.__calcMsg);
   } catch (err) {
+    if (isSignInRequired(err.message)) {
+      demandHisabLogin(false, 'Calculate API-র জন্য সাইন-ইন লাগবে।');
+      return;
+    }
     window.__calcMsg = err.message || 'Calculate failed';
     (window.__calcSteps || []).forEach(s => {
       if (s.status === 'pending' || s.status === 'run') { s.status = 'fail'; s.detail = window.__calcMsg; }
@@ -2197,7 +2241,7 @@ function render(force) {
   const a = document.activeElement;
   if (!force && a && a.closest('main') && ['INPUT', 'SELECT', 'TEXTAREA'].includes(a.tagName)) { pendingRender = true; return; }
   pendingRender = false;
-  const errCount = (cfg().syncErrors || []).length;
+  const errCount = visibleSyncErrors().length;
   const link = ([k, l]) => `<a href="#/${k}" class="${k === page ? 'on' : ''}">${esc(l)}${k === 'errors' && errCount ? ` (${errCount})` : ''}</a>`;
   $('#nav').innerHTML = '<div class="logo"><span>H</span>Hisab</div>' + NAV_GROUPS.map(([label, keys]) => `<div class="nav-sec"><div class="nav-label">${esc(label)}</div>${NAV.filter(([k]) => keys.includes(k)).map(link).join('')}</div>`).join('');
   const open = window.__navGroup || '';
@@ -3112,16 +3156,21 @@ const VIEWS = {
       <button class="btn primary" data-click="calculateNow" ${window.__calcBusy ? 'disabled' : ''}>${esc(calcBtnLabel())}</button><button class="btn" data-click="csv">Export CSV</button>
       <button class="btn danger" data-click="clearSheet" ${window.__sheetClearing ? 'disabled' : ''} title="Delete all Live Sheet rows and start fresh">${window.__sheetClearing ? 'Clearing…' : 'Clear Live Sheet'}</button>
       <label style="flex-direction:row;align-items:center;color:inherit"><input type="checkbox" data-act="exfin" ${window.__exFin ? 'checked' : ''}> profit: leave out owner / loan money</label>
-      ${window.__calcMsg ? `<p class="muted">${esc(window.__calcMsg)}</p>` : ''}${(cfg().syncErrors || []).length ? `<p class="err">${(cfg().syncErrors || []).length} check(s) failed. Open Errors for the list.</p>` : ''}</div>
+      ${window.__calcMsg ? `<p class="muted">${esc(window.__calcMsg)}</p>` : ''}${visibleSyncErrors().length ? `<p class="err">${visibleSyncErrors().length} check(s) failed. Open Errors for the list.</p>` : ''}</div>
     <div class="tw"><table class="sheet"><tr><th>Time (BST)</th>${items.map(i => `<th class="n">${esc(ECOM_SALE.has(i.name) ? shortName(i.name) : uiName(i.name))}</th>`).join('')}${tot.map(([, l]) => `<th class="n">${l}</th>`).join('')}<th class="n">Profit (today)</th><th>Source</th><th class="why"></th></tr>
     ${shown.map(rowHtml).join('') || '<tr><td colspan="99" class="muted">No rows yet.</td></tr>'}</table></div>`;
   },
 
   errors() {
-    const list = cfg().syncErrors || [];
+    const raw = cfg().syncErrors || [];
+    const authOnly = authErrorsOnly(raw);
+    const list = visibleSyncErrors();
     return `<div class="card"><h3>Check errors</h3>
       <p class="muted">Every ${Math.max(0, Number(cfg().interval) || 0) || '—'} minutes the <b>production server</b> pulls Steadfast, Pathao and EcomDrive, writes balances + a Live Sheet row to Firestore — even if this browser is closed. Open any phone/PC to see the same sheet.</p>
       <p class="muted">Last full check: ${cfg().lastCalcAt ? dt(cfg().lastCalcAt) : 'not yet'}</p>
+      ${authOnly && !window.__hisabSessionOk ? `<p class="err">Sign in required — Hisab ইমেইল/পাসওয়ার্ড দিয়ে ঢুকুন। শুধু Gmail/Firebase যথেষ্ট নয়।</p>
+      <button class="btn" data-click="hisabLogin">Sign in</button> ` : ''}
+      ${authOnly && window.__hisabSessionOk ? `<p class="muted">আগে Sign in required হয়েছিল; এখন সেশন আছে। Calculate now চাপলে ফ্রেশ চেক হবে।</p>` : ''}
       <button class="btn primary" data-click="calculateNow" ${window.__calcBusy ? 'disabled' : ''}>${esc(calcBtnLabel())}</button>
       ${window.__calcMsg ? `<p class="muted">${esc(window.__calcMsg)}</p>` : ''}</div>
       <div class="tw"><table><tr><th>Source</th><th>Problem</th><th>When</th></tr>${list.map(e => `<tr><td>${esc(e.name)}</td><td>${esc(e.message)}</td><td>${dt(e.at)}</td></tr>`).join('') || '<tr><td colspan="3" class="muted">No errors. The last checks completed.</td></tr>'}</table></div>`;
@@ -3508,6 +3557,10 @@ document.addEventListener('click', async e => {
       render(true);
     }
     else if (a === 'csv') exportCsv();
+    else if (a === 'hisabLogin') {
+      const gate = await apiGate();
+      demandHisabLogin(gate.setup, 'Calculate API-র জন্য Hisab ইমেইল/পাসওয়ার্ড দিয়ে ঢুকুন।');
+    }
     else if (a === 'clearSheet') {
       if (window.__sheetClearing) return;
       if (!confirm('Clear the entire Live Sheet and start fresh? Accounts and balances stay. Old sheet rows will be deleted.')) return;
@@ -3727,6 +3780,19 @@ function loginMessage(status, data) {
   if (data.error === 'no email') return 'সার্ভারে HISAB_EMAIL সেট নেই — VPS-এ worker/.env চেক করুন।';
   return 'ঢোকা যায়নি।';
 }
+function isSignInRequired(msg) {
+  return /sign in required/i.test(String(msg || ''));
+}
+function authErrorsOnly(list) {
+  const rows = Array.isArray(list) ? list : [];
+  return rows.length > 0 && rows.every(e => isSignInRequired(e.message || e.detail));
+}
+/** Errors badge/list: hide stale Sign-in rows when Hisab session is already OK. */
+function visibleSyncErrors() {
+  const list = cfg().syncErrors || [];
+  if (window.__hisabSessionOk && authErrorsOnly(list)) return [];
+  return list;
+}
 /** Production (non-loopback) needs hisab_session for Calculate APIs; localhost loopback does not. */
 async function apiGate() {
   try {
@@ -3760,6 +3826,57 @@ function showLogin(setup, offline) {
     : 'ইমেইল আর পাসওয়ার্ড দিয়ে ঢুকুন। Calculate API-র জন্য সেশন লাগবে।';
   $('#loginBtn').textContent = setup ? 'পাসওয়ার্ড সেভ করুন' : 'ঢুকুন';
   $('#loginErr').textContent = offline ? 'সার্ভার বন্ধ। worker ফোল্ডারে node server.mjs চালু আছে কিনা দেখুন।' : '';
+}
+/** Mid-session 401: leave the app and show the Hisab password form (Firebase-only login is not enough). */
+function demandHisabLogin(setup, detail) {
+  showLogin(!!setup, false);
+  if (detail) $('#loginErr').textContent = detail;
+  toast('Calculate-এর জন্য Hisab সাইন-ইন লাগবে');
+}
+async function ensureHisabSession() {
+  // Localhost loopback APIs do not need hisab_session.
+  if (location.hostname === '127.0.0.1' || location.hostname === 'localhost') {
+    window.__hisabSessionOk = true;
+    return { ok: true, setup: false };
+  }
+  try {
+    const res = await api('/api/session');
+    const data = await res.json().catch(() => ({}));
+    if (data.ok) {
+      window.__hisabSessionOk = true;
+      return { ok: true, setup: false };
+    }
+    window.__hisabSessionOk = false;
+    demandHisabLogin(!!data.setup, 'সেশন নেই বা মেয়াদ শেষ — আবার ঢুকুন।');
+    return { ok: false, setup: !!data.setup };
+  } catch {
+    window.__hisabSessionOk = false;
+    demandHisabLogin(false, 'সার্ভার থেকে সেশন চেক করা যায়নি।');
+    return { ok: false, setup: false };
+  }
+}
+/** Drop stale "Sign in required" rows once Hisab session is OK again. */
+async function clearStaleSignInErrors() {
+  const list = cfg().syncErrors || [];
+  if (!authErrorsOnly(list)) return false;
+  try {
+    const res = await api('/api/session');
+    const data = await res.json().catch(() => ({}));
+    if (!data.ok) {
+      window.__hisabSessionOk = false;
+      demandHisabLogin(!!data.setup, 'Errors-এ Sign in required — আগে Hisab-এ ঢুকুন।');
+      return false;
+    }
+    window.__hisabSessionOk = true;
+  } catch {
+    return false;
+  }
+  let main = S.settings.find(x => x.id === 'main');
+  if (main) main.syncErrors = [];
+  mirrorLocal('settings', 'main', { syncErrors: [], updatedAt: new Date().toISOString() });
+  try { await saveMainSettings({ syncErrors: [] }); } catch { /* quota — UI already cleared */ }
+  render(true);
+  return true;
 }
 
 document.addEventListener('submit', async e => {
@@ -3845,6 +3962,8 @@ function start() {
   route();
   setInterval(tick, 15000);
   setTimeout(tick, 3000);
+  // Stale Errors from a prior 401 should not linger after a valid hisab_session exists.
+  setTimeout(() => { clearStaleSignInErrors().catch(() => {}); }, 1500);
   // One-shot: ?clearSheet=1 clears Live Sheet after data listeners attach.
   if (/[?&]clearSheet=1\b/.test(location.search)) {
     const u = new URL(location.href);
@@ -3860,9 +3979,11 @@ function start() {
   const gate = await apiGate();
   if (gate.gate) {
     // Production: do not auto-anonymous into the app — Calculate APIs need hisab_session first.
+    window.__hisabSessionOk = false;
     showLogin(gate.setup, gate.offline);
     return;
   }
+  window.__hisabSessionOk = true;
   if (!DEMO) {
     try {
       const u = await A.auth.open();

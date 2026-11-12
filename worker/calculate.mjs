@@ -19,11 +19,53 @@ const AWAITING = 'Steadfast · Awaiting approval';
 const workerDir = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.HISAB_DATA_DIR || workerDir;
 const smsPath = process.env.HISAB_SMS_FILE || path.join(dataDir, 'sms-balances.json');
+const localSheetPath = path.join(dataDir, 'local-sheet.json');
+const localCachePath = path.join(dataDir, 'local-cache.json');
 
 let busy = false;
 let lastRun = null;
 let liveSteps = [];
 let liveStartedAt = null;
+
+function saveLocalSheet(payload) {
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(localSheetPath, JSON.stringify(payload, null, 2));
+  } catch { /* disk full / permission — calculate status still carries the row */ }
+}
+
+function saveLocalCache(settings, items) {
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(localCachePath, JSON.stringify({
+      savedAt: new Date().toISOString(),
+      settings: settings || { id: 'main' },
+      items: Array.isArray(items) ? items : []
+    }));
+  } catch { /* ignore */ }
+}
+
+function loadLocalCache() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(localCachePath, 'utf8'));
+    if (!raw || !Array.isArray(raw.items)) return null;
+    return {
+      settings: raw.settings && typeof raw.settings === 'object' ? raw.settings : { id: 'main' },
+      items: raw.items
+    };
+  } catch {
+    try {
+      const sheet = JSON.parse(fs.readFileSync(localSheetPath, 'utf8'));
+      if (Array.isArray(sheet.items) && sheet.items.length) {
+        return {
+          settings: { id: 'main', lastCalcAt: sheet.lastCalcAt, paymentWatch: sheet.paymentWatch || {}, syncErrors: sheet.syncErrors || [] },
+          items: sheet.items
+        };
+      }
+    } catch { /* ignore */ }
+    return null;
+  }
+}
 
 export function calculateStatus() {
   return {
@@ -221,6 +263,20 @@ function findByExt(items, externalId) {
   return items.find(i => !i.archived && i.externalId === externalId);
 }
 
+function sameField(a, b) {
+  if (a === b) return true;
+  if (a == null && b == null) return true;
+  if (typeof a === 'number' || typeof b === 'number') return Number(a) === Number(b);
+  return String(a ?? '') === String(b ?? '');
+}
+
+/** Skip Firestore write when money/include fields did not change — free-tier quota burns otherwise. */
+function itemUnchanged(it, body) {
+  if (!it) return false;
+  const keys = ['balance', 'include', 'name', 'group', 'currency', 'externalId', 'paymentId', 'paymentState', 'opening', 'source', 'archived', 'category'];
+  return keys.every(k => body[k] === undefined || sameField(it[k], body[k]));
+}
+
 async function upsertItem(items, patch) {
   const now = new Date().toISOString();
   let it = null;
@@ -233,14 +289,27 @@ async function upsertItem(items, patch) {
     prev: it ? (it.balance || 0) : (patch.balance || 0)
   };
   if (it) {
+    if (itemUnchanged(it, body)) {
+      // Keep memory row; do not spend a Firestore write.
+      return it;
+    }
     Object.assign(it, body);
-    await setDocMerge('items', it.id, body);
+    try {
+      await setDocMerge('items', it.id, body);
+    } catch (err) {
+      // Memory already updated — Live Sheet can still use fresh numbers if only cloud quota tripped.
+      if (!/quota exceeded/i.test(err.message || '')) throw err;
+    }
     return it;
   }
   const id = patch.id || ('srv_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
   const row = { id, include: true, archived: false, currency: 'BDT', ...body };
   items.push(row);
-  await setDocMerge('items', id, row);
+  try {
+    await setDocMerge('items', id, row);
+  } catch (err) {
+    if (!/quota exceeded/i.test(err.message || '')) throw err;
+  }
   return row;
 }
 
@@ -293,26 +362,39 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
     busy = false;
     throw new Error('Firestore not configured on server (FIREBASE_AUTH_EMAIL / FIREBASE_AUTH_PASSWORD + FIREBASE_*)');
   }
-  // Fail fast with a clear message if Firestore API/DB is not ready.
+  // Prefer cloud; on quota/network fall back to last local cache so Calculate still runs.
+  let settings = { id: 'main' };
+  let items = [];
+  let usedLocalCache = false;
   try {
-    await getMainSettings();
+    settings = await getMainSettings();
+    items = await listDocs('items');
+    saveLocalCache(settings, items);
   } catch (err) {
-    busy = false;
     const msg = err.message || String(err);
     const project = process.env.FIREBASE_PROJECT_ID || '';
     if (/has not been used|disabled|PERMISSION_DENIED/i.test(msg)) {
+      busy = false;
       throw new Error('Cloud Firestore API is disabled for this Firebase project. Enable it: https://console.developers.google.com/apis/api/firestore.googleapis.com/overview?project=' + project);
     }
     if (/database \(default\) does not exist|does not exist for project/i.test(msg)) {
+      busy = false;
       throw new Error('Firestore database is missing. Create it (Native mode): https://console.firebase.google.com/project/' + project + '/firestore');
     }
-    throw err;
+    const cached = loadLocalCache();
+    if (!cached) {
+      busy = false;
+      throw new Error(msg + ' — no local cache yet. Wait for Firestore quota reset, then Calculate once to seed cache.');
+    }
+    settings = cached.settings;
+    items = cached.items.map(r => ({ ...r }));
+    usedLocalCache = true;
+    console.warn('calculate: Firestore unavailable (' + msg + ') — using local-cache.json');
   }
   const startedAt = liveStartedAt || new Date().toISOString();
   const steps = liveSteps;
+  let fallbackPayload = null;
   try {
-    let settings = await getMainSettings();
-    let items = await listDocs('items');
     let paymentWatch = { ...(settings.paymentWatch || {}) };
     let invoices = [];
 
@@ -533,7 +615,7 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
     }, steps);
 
     await step('Live Sheet', async () => {
-      items = await listDocs('items');
+      // Use in-memory items from this run — do not re-listDocs (burns free-tier read quota).
       settings = { ...settings, paymentWatch };
       const t = compute(items, settings);
       const now = new Date();
@@ -564,15 +646,67 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
           nw: t.nw
         }
       };
-      const id = await addDocRow('snapshots', row);
       const calcAt = now.toISOString();
-      await setDocMerge('settings', 'main', {
-        paymentWatch,
-        lastCalcAt: calcAt,
-        interval: Math.max(0, Number(settings.interval) || 0),
-        syncErrors: steps.filter(s => s.status === 'fail').map(s => ({ name: s.name, message: s.detail, at: calcAt })),
-        updatedAt: calcAt
-      });
+      let id = '';
+      let cloudOk = false;
+      let cloudErr = '';
+      try {
+        id = await addDocRow('snapshots', row);
+        cloudOk = true;
+      } catch (err) {
+        cloudErr = err.message || String(err);
+        if (/quota exceeded/i.test(cloudErr)) {
+          try {
+            await setDocMerge('snapshots', 'latest', { ...row, id: 'latest' });
+            id = 'latest';
+            cloudOk = true;
+            cloudErr = '';
+          } catch (err2) {
+            cloudErr = err2.message || cloudErr;
+          }
+        }
+      }
+      const fails = steps.filter(s => s.status === 'fail');
+      const syncErrors = fails.map(s => ({ name: s.name, message: s.detail, at: calcAt }));
+      try {
+        await setDocMerge('settings', 'main', {
+          paymentWatch,
+          lastCalcAt: calcAt,
+          interval: Math.max(0, Number(settings.interval) || 0),
+          syncErrors,
+          updatedAt: calcAt
+        });
+      } catch (err) {
+        if (!cloudErr) cloudErr = err.message || String(err);
+      }
+      if (!cloudOk) {
+        id = id || ('local_' + Date.now().toString(36));
+        const sheetRow = { id, ...row };
+        const itemRows = items.filter(i => !i.archived).map(i => ({
+          id: i.id,
+          name: i.name,
+          group: i.group,
+          balance: i.balance,
+          prev: i.prev,
+          opening: i.opening,
+          currency: i.currency,
+          externalId: i.externalId,
+          include: i.include,
+          archived: i.archived,
+          source: i.source,
+          updatedAt: i.updatedAt || calcAt
+        }));
+        fallbackPayload = {
+          sheetRow,
+          items: itemRows,
+          syncErrors,
+          lastCalcAt: calcAt,
+          localFallback: true,
+          cloudError: cloudErr || 'Firestore write failed'
+        };
+        saveLocalSheet({ ...fallbackPayload, paymentWatch });
+        return id + ' · nw=' + (t.nw / 100).toFixed(2) + ' · local (cloud quota)';
+      }
       return id + ' · nw=' + (t.nw / 100).toFixed(2);
     }, steps);
 
@@ -580,7 +714,8 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
       at: startedAt,
       finishedAt: new Date().toISOString(),
       steps,
-      ok: steps.every(s => s.status === 'ok')
+      ok: steps.every(s => s.status === 'ok'),
+      ...(fallbackPayload || {})
     };
     return { ok: lastRun.ok, busy: false, steps, lastRun };
   } finally {
