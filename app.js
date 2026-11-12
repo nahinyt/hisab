@@ -3300,15 +3300,16 @@ function fwdLiveHtml(st) {
   const f = window.__fwdFilter || '';
   const pill = r => { const [label, tone] = FWD_STATUS[r.status] || [r.status, '']; return `<span class="fwd-pill ${tone}">${esc(label)}</span>`; };
   const sentBits = lr ? Object.entries(lr.sent || {}).map(([x, n]) => ` · ${n} ${esc(((FWD_STATUS[x] || [x])[0]).toLowerCase())}`).join('') : '';
+  const srcLabel = (Array.isArray(s.sourceStatuses) && s.sourceStatuses.length ? s.sourceStatuses : ['PENDING'])
+    .map(x => ({ PENDING: 'Pending', SHIPPED: 'Shipped', RTS: 'RTS' }[x] || x)).join(' + ');
   const lastRunText = lr
-    ? `${dt(lr.finished || lr.started)} · ${lr.fetched} pending orders · ${lr.newIds} new${sentBits}${lr.error ? ` · <b class="neg">${esc(lr.error)}</b>` : ''}`
+    ? `${dt(lr.finished || lr.started)} · ${lr.fetched} orders (${esc(srcLabel)}) · ${lr.newIds} new${sentBits}${lr.error ? ` · <b class="neg">${esc(lr.error)}</b>` : ''}`
     : 'Never';
   const done = r => ['forwarded', 'exists'].includes(r.status);
   const rows = st.rows.map(r => `<tr>
       <td><b>${esc(r.invoice_id)}</b></td><td>${esc(r.phone)}</td><td>${esc(r.name)}</td><td>${esc(r.courier)}</td>
       <td class="n">৳${Number(r.cod_amount || 0).toLocaleString('en-IN')}</td><td>${pill(r)}</td><td class="n">${r.attempts}</td>
       <td>${r.last_attempt_at ? dt(r.last_attempt_at) : '<span class="muted">—</span>'}${r.next_retry_at && !done(r) ? `<small class="muted">retry ${dt(r.next_retry_at)}</small>` : ''}</td>
-      <td class="fwd-msg">${esc(r.last_message || '')}</td>
       <td class="fwd-row-btns">${r.attempts ? `<button class="btn sm" data-click="fwdLog" data-id="${esc(r.invoice_id)}">Request</button>` : `<button class="btn sm" data-click="fwdPreview" data-id="${esc(r.invoice_id)}">Preview</button>`}${['failed', 'no_match', 'invalid'].includes(r.status) ? `<button class="btn sm" data-click="fwdRetryOne" data-id="${esc(r.invoice_id)}">Retry</button>` : ''}</td>
     </tr>`).join('');
   return `<div class="fwd-status">
@@ -3337,8 +3338,8 @@ function fwdLiveHtml(st) {
           <button class="btn sm" data-click="fwdRetry" data-which="failed" ${k.errors ? '' : 'disabled'}>Retry errors (${k.errors})</button>
         </div>
       </div>
-      <div class="tw"><table class="fwd-table"><tr><th>Invoice ID</th><th>Phone</th><th>Name</th><th>Courier</th><th class="n">COD</th><th>Status</th><th class="n">Tries</th><th>Last attempt</th><th>Response</th><th></th></tr>
-      ${rows || '<tr><td colspan="10" class="muted">No invoices yet. Press “Sync now”.</td></tr>'}
+      <div class="tw"><table class="fwd-table"><tr><th>Invoice ID</th><th>Phone</th><th>Name</th><th>Courier</th><th class="n">COD</th><th>Status</th><th class="n">Tries</th><th>Last attempt</th><th></th></tr>
+      ${rows || '<tr><td colspan="9" class="muted">No invoices yet. Press “Sync now”.</td></tr>'}
       </table></div>
     </div>`;
 }
@@ -3354,7 +3355,11 @@ document.addEventListener('submit', async e => {
   const f = e.target.closest('[data-fwd-form]'); if (!f) return;
   e.preventDefault(); e.stopImmediatePropagation();
   const fd = new FormData(f);
-  const patch = { apiUrl: fd.get('apiUrl'), intervalMin: fd.get('intervalMin') };
+  const patch = {
+    apiUrl: fd.get('apiUrl'),
+    intervalMin: fd.get('intervalMin'),
+    sourceStatuses: fd.getAll('sourceStatuses').map(String)
+  };
   if (String(fd.get('apiKey') || '').trim()) patch.apiKey = fd.get('apiKey');
   try {
     await fwdPost('/api/forwarder/settings', patch);
@@ -3453,8 +3458,10 @@ const VIEWS = {
     const st = window.__fwd;
     if (!st) return '<div class="card"><p class="muted">Loading invoice forwarder…</p></div>';
     const s = st.settings;
+    const src = new Set(Array.isArray(s.sourceStatuses) && s.sourceStatuses.length ? s.sourceStatuses : ['PENDING']);
+    const srcBox = (val, label) => `<label class="fwd-src"><input type="checkbox" name="sourceStatuses" value="${val}" ${src.has(val) ? 'checked' : ''}> ${label}</label>`;
     return `<div class="fwd-switch ${s.enabled ? 'on' : ''}">
-        <div><h3>Ecom Drive → PackKoro</h3><p class="muted">Pending orders থেকে invoice ID নিয়ে PackKoro Invoice API-তে পাঠায়। একবার সফল হলে সেই invoice আর কখনো পাঠানো হয় না।</p></div>
+        <div><h3>Ecom Drive → PackKoro</h3><p class="muted">সিলেক্ট করা Ecom Drive স্ট্যাটাস (Pending / Shipped / RTS) থেকে invoice ID নিয়ে PackKoro Invoice API-তে পাঠায়। একবার সফল হলে সেই invoice আর কখনো পাঠানো হয় না।</p></div>
         <div class="fwd-actions">
           <button class="btn ${s.enabled ? 'danger' : 'primary'}" data-click="fwdToggle">${s.enabled ? 'Stop automation' : 'Start automation'}</button>
           <button class="btn" data-click="fwdSync" ${st.running ? 'disabled' : ''}>${st.running ? 'Syncing…' : 'Sync now'}</button>
@@ -3466,6 +3473,12 @@ const VIEWS = {
         <label>Destination API URL<input name="apiUrl" type="url" required placeholder="https://packkoro.com/api/ecomdrive/invoice" value="${esc(s.apiUrl)}"></label>
         <label>API key <small class="muted">${s.hasKey ? 'saved ' + esc(s.keyMask) + ' — leave empty to keep' : 'not set'}</small><input name="apiKey" type="password" autocomplete="new-password" placeholder="${s.hasKey ? '••••••••' : 'Bearer token'}"></label>
         <label>Polling interval (minutes)<input name="intervalMin" type="number" min="1" max="1440" value="${s.intervalMin}"></label>
+        <fieldset class="fwd-sources"><legend>Fill from Ecom Drive</legend>
+          ${srcBox('PENDING', 'Pending')}
+          ${srcBox('SHIPPED', 'Shipped')}
+          ${srcBox('RTS', 'RTS')}
+          <p class="muted">ডিফল্ট Pending। চাইলে Shipped আর RTSও টিক দিন — Sync সেই লিস্টগুলো থেকেও invoice নেবে।</p>
+        </fieldset>
         <div class="fwd-form-btns"><button class="btn primary">Save settings</button> <button type="button" class="btn" data-click="fwdTest">Test connection</button></div>
       </form>
       <p class="muted">API key সার্ভারে থাকে, ব্রাউজারে ফেরত আসে না। পাঠানো হয় <code>Authorization: Bearer …</code> হেডারে। Body হুবহু: <code>{"phone","name","address","cod_amount","invoice_id"}</code>।</p>

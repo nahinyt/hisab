@@ -1,4 +1,4 @@
-// Ecom Drive Pending Orders → PackKoro Ecom Drive Invoice API.
+// Ecom Drive orders (Pending / Shipped / RTS — selectable) → PackKoro Ecom Drive Invoice API.
 //
 // Every invoice ID is one row in SQLite (PRIMARY KEY = invoice_id). Before a send, the row is
 // claimed with a single UPDATE that only succeeds from a sendable state; a row that reached
@@ -18,6 +18,7 @@ import { ecomGet } from './ecomdrive.mjs';
 
 const workerDir = path.dirname(fileURLToPath(import.meta.url));
 const DONE = new Set(['forwarded', 'exists']);
+const SOURCE_STATUSES = ['PENDING', 'SHIPPED', 'RTS'];
 const PAGE = 50;
 const SEND_TIMEOUT_MS = 15000;
 const IN_RUN_TRIES = 3;           // network/5xx retries inside one run: 1s, 2s
@@ -92,6 +93,23 @@ export function _setSources({ fetchPending, fetchFn } = {}) {
 }
 
 // ---------- settings (API key stays server-side; only a mask leaves this module) ----------
+function normalizeSourceStatuses(raw) {
+  let list = [];
+  if (Array.isArray(raw)) list = raw;
+  else if (typeof raw === 'string' && raw.trim()) {
+    try { list = JSON.parse(raw); } catch { list = raw.split(/[,\s]+/); }
+  }
+  const allowed = new Set(SOURCE_STATUSES);
+  const out = [...new Set((Array.isArray(list) ? list : [])
+    .map(s => String(s || '').trim().toUpperCase())
+    .filter(s => allowed.has(s)))];
+  return out.length ? out : ['PENDING'];
+}
+
+export function getSourceStatuses() {
+  return normalizeSourceStatuses(kvGet('source_statuses', '["PENDING"]'));
+}
+
 export function getSettings({ withKey = false } = {}) {
   const key = kvGet('api_key');
   return {
@@ -99,6 +117,7 @@ export function getSettings({ withKey = false } = {}) {
     enabled: kvGet('enabled', '0') === '1',
     intervalMin: Math.max(1, Number(kvGet('interval_min', '5')) || 5),
     noMatchRetryMin: Math.max(5, Number(kvGet('no_match_retry_min', '30')) || 30),
+    sourceStatuses: getSourceStatuses(),
     hasKey: !!key,
     keyMask: key ? '••••' + key.slice(-4) : '',
     ...(withKey ? { apiKey: key } : {})
@@ -128,6 +147,9 @@ export function saveSettings(patch = {}) {
     const n = Math.round(Number(patch.noMatchRetryMin));
     if (!(n >= 5 && n <= 10080)) throw new Error('No-match retry must be 5–10080 minutes');
     kvSet('no_match_retry_min', n);
+  }
+  if (patch.sourceStatuses != null) {
+    kvSet('source_statuses', JSON.stringify(normalizeSourceStatuses(patch.sourceStatuses)));
   }
   return getSettings();
 }
@@ -174,16 +196,35 @@ export function payloadOf(row) {
 }
 
 // ---------- source: Ecom Drive (read-only) ----------
-export async function fetchPendingFromEcomDrive() {
-  const methods = await ecomGet('/order-badges/delivery-methods', { status: 'PENDING' });
+/** Pull one Ecom Drive status bucket (PENDING / SHIPPED / RTS) via delivery-method queues. */
+async function fetchOrdersForStatus(status) {
+  const methods = await ecomGet('/order-badges/delivery-methods', { status });
   const list = (methods?.items || []).filter(m => m.deliveryMethodId && Number(m.count) > 0);
   const out = [];
   for (const m of list) {
     for (let skip = 0; skip < 5000; skip += PAGE) {
-      const q = await ecomGet('/approved-orders/queue', { status: 'PENDING', deliveryMethodId: m.deliveryMethodId, skip, take: PAGE });
+      const q = await ecomGet('/approved-orders/queue', { status, deliveryMethodId: m.deliveryMethodId, skip, take: PAGE });
       const docs = (q?.items?.length ? q.items : q?.documents) || [];
       out.push(...docs);
       if (docs.length < PAGE) break;
+    }
+  }
+  return out;
+}
+
+/** Selected statuses from Settings (Pending default; Shipped / RTS optional). */
+export async function fetchPendingFromEcomDrive() {
+  const statuses = getSourceStatuses();
+  const out = [];
+  const seen = new Set();
+  for (const status of statuses) {
+    const docs = await fetchOrdersForStatus(status);
+    for (const doc of docs) {
+      const id = String(doc?.order?.invoiceNumber ?? doc?.invoiceNumber ?? doc?.order?.record?.invoiceNumber ?? '');
+      const key = id || JSON.stringify(doc?.order?.id || doc?.id || doc);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(doc);
     }
   }
   return out;
@@ -327,12 +368,13 @@ export async function runSync({ trigger = 'auto' } = {}) {
           next_retry_at = ? WHERE status = 'sending' AND claimed_at < ?`)
         .run(now(), new Date(Date.now() - STALE_SENDING_MS).toISOString());
 
+      const allowed = new Set(getSourceStatuses());
       const docs = await fetchPendingImpl();
       const at = now();
       const seen = new Set();
       for (const doc of docs) {
         const o = mapEcomOrder(doc);
-        if (o.status && o.status !== 'PENDING') continue;
+        if (o.status && !allowed.has(o.status)) continue;
         if (!o.invoice_id) continue;
         summary.fetched++;
         if (seen.has(o.invoice_id)) { summary.skippedDone++; continue; } // same invoice twice in one scan
