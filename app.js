@@ -2490,7 +2490,7 @@ function kpiData() {
 }
 function breakdown(k) {
   const { t, c, d, b } = kpiData();
-  const lines = g => t.parts.filter(p => g.includes(p.it.group)).map(p => `<tr class="${p.inc ? '' : 'dim'}"><td>${esc(uiName(p.it.name))}</td><td class="n">${fmt(p.it.balance, p.it.currency)}</td><td class="n">${p.it.currency !== c.base ? 'rate ' + esc(c.rates?.[p.it.currency] || '?') : ''}</td><td class="n">${fmt(p.v)}</td><td>${p.inc ? 'counted' : 'excluded'}</td></tr>`).join('');
+  const lines = g => t.parts.filter(p => g.includes(p.it.group)).map(p => `<tr class="${p.inc ? '' : 'dim'}${stmtAttrs(p.it)}><td>${esc(uiName(p.it.name))}</td><td class="n">${fmt(p.it.balance, p.it.currency)}</td><td class="n">${p.it.currency !== c.base ? 'rate ' + esc(c.rates?.[p.it.currency] || '?') : ''}</td><td class="n">${fmt(p.v)}</td><td>${p.inc ? 'counted' : 'excluded'}</td></tr>`).join('');
   const tb = h => `<div class="tw"><table><tr><th>Item</th><th class="n">Original</th><th class="n">Rate</th><th class="n">In ${c.base}</th><th>Status</th></tr>${h}</table></div>`;
   if (['cash', 'courier', 'stock', 'supplier', 'owner'].includes(k)) {
     const g = k === 'supplier' ? ['supplier', 'otherLiab'] : k === 'stock' ? ['stock', 'otherAsset'] : [k];
@@ -3093,6 +3093,122 @@ function sheetWhy(id, prevId) {
     <p class="muted">লাল মানে কমেছে, সবুজ মানে বেড়েছে। তীর মানে টাকা বা পণ্য ওই দিক থেকে ওই দিকে গেছে।</p>`;
 }
 
+/** Statement for one supplier / bank item: every change across Live Sheet rows, newest first,
+ *  with the bank (or supplier) that moved by the same amount between the same two rows. */
+const STMT_GROUPS = ['supplier', 'otherLiab', 'cash'];
+/** Rest of a <tr class="…"> opener: closes the class and adds the click hook for statement rows. */
+function stmtAttrs(it) {
+  return STMT_GROUPS.includes(it?.group) && it.id
+    ? ` click-row" data-click="stmt" data-id="${esc(it.id)}" title="স্টেটমেন্ট দেখুন"`
+    : '"';
+}
+/** Between two sheet rows, find the smallest set of same-direction moves that balance:
+ *  {this item + other items on its side} ≈ {items on the other side}, e.g.
+ *  supplier A ▼1.5L + supplier B ▼1.7L = bank ▼3.2L. Tolerance ৳10 or 2% (bank charge). */
+function stmtMatch(a, b, id, delta, ownGroups, pairGroups, groupOf, nameOf) {
+  const sign = Math.sign(delta);
+  const moves = groups => Object.keys(b.values || {}).map(k => {
+    if (!groups.includes(groupOf(k))) return null;
+    const x0 = a.values?.[k], x1 = b.values[k];
+    if (x0 == null || x1 == null) return null;
+    const d = x1 - x0;
+    return d && Math.sign(d) === sign ? { k, d, x0, x1, name: nameOf(b, k) } : null;
+  }).filter(Boolean).sort((p, q) => Math.abs(q.d) - Math.abs(p.d));
+  const other = moves(pairGroups).slice(0, 8);
+  if (!other.length) return null;
+  const own = moves(ownGroups).filter(m => m.k !== id).slice(0, 7);
+  const me = { k: id, d: delta, x0: a.values[id], x1: b.values[id], name: nameOf(b, id) };
+  const subsets = (list, max) => {
+    const out = [];
+    for (let mask = 1; mask < (1 << list.length); mask++) {
+      const s = list.filter((_, i) => mask & (1 << i));
+      if (s.length <= max) out.push(s);
+    }
+    return out;
+  };
+  const sum = s => s.reduce((t, m) => t + Math.abs(m.d), 0);
+  const ownSets = [[me], ...subsets(own, 3).map(s => [me, ...s])];
+  const otherSets = subsets(other, 4);
+  let best = null;
+  for (const A of ownSets) {
+    const sa = sum(A);
+    for (const B of otherSets) {
+      const gap = Math.abs(sa - sum(B));
+      if (gap > Math.max(1000, sa * 0.02)) continue;
+      const size = A.length + B.length;
+      if (!best || size < best.size || (size === best.size && gap < best.gap)) best = { own: A, other: B, gap, size };
+    }
+  }
+  return best;
+}
+function itemStatement(id) {
+  const it = S.items.find(i => i.id === id);
+  if (!it) return '<p>এই ঘরটা আর খুঁজে পাওয়া যায়নি।</p>';
+  const isLiab = it.group === 'supplier' || it.group === 'otherLiab';
+  const pairGroups = isLiab ? ['cash'] : ['supplier', 'otherLiab'];
+  const title = uiName(it.name);
+  const snaps = sortedSnaps().filter(s => s.values?.[id] != null);
+  if (!snaps.length) return `<h3>${esc(title)} · স্টেটমেন্ট</h3><p>শিটে এখনো এই ঘরের কোনো হিসাব নেই।</p>`;
+  const ownGroups = isLiab ? ['supplier', 'otherLiab'] : ['cash'];
+  const groupOf = k => S.items.find(i => i.id === k)?.group;
+  const nameOf = (s, k) => uiName(s.names?.[k] || S.items.find(i => i.id === k)?.name || k);
+  const rows = [];
+  let up = 0, down = 0;
+  for (let i = 1; i < snaps.length; i++) {
+    const a = snaps[i - 1], b = snaps[i];
+    const before = a.values[id], after = b.values[id], delta = after - before;
+    if (!delta) continue;
+    if (delta > 0) up += delta; else down -= delta;
+    rows.push({ ts: b.ts, before, delta, after, link: stmtMatch(a, b, id, delta, ownGroups, pairGroups, groupOf, nameOf) });
+  }
+  const first = snaps[0], last = snaps[snaps.length - 1];
+  const open = first.values[id], now = last.values[id];
+  const eq = (x, d, y) => `${fmt(x)} ${d > 0 ? '+' : '−'} ${fmt(Math.abs(d))} = <b>${fmt(y)}</b>`;
+  const plus = list => list.map(m => `${esc(m.name)} ${fmt(Math.abs(m.d))}`).join(' + ');
+  const total = list => list.reduce((t, m) => t + Math.abs(m.d), 0);
+  const names = list => list.map(m => esc(m.name)).join(' আর ');
+  const why = r => {
+    if (r.link) {
+      const liab = isLiab ? r.link.own : r.link.other, cash = isLiab ? r.link.other : r.link.own;
+      const gapNote = r.link.gap ? ` <span class="muted">(দুই পাশে ${fmt(r.link.gap)} পার্থক্য)</span>` : '';
+      const head = r.delta < 0
+        ? `↳ ${names(cash)} থেকে ${fmt(total(cash))} দিয়ে ${liab.length > 1 ? `${liab.length}টা বাকি একসাথে` : 'বাকি'} শোধ হয়েছে।`
+        : `↳ ${names(liab)}-এর বাকি বেড়েছে, ${names(cash)}-এ সমান টাকা ঢুকেছে (ধার নেওয়া?)।`;
+      const sums = [
+        liab.length > 1 ? `<p class="stmt-side">বাকি ${r.delta < 0 ? 'কমেছে' : 'বেড়েছে'}: ${plus(liab)} = <b>${fmt(total(liab))}</b></p>` : '',
+        cash.length > 1 ? `<p class="stmt-side">টাকা ${r.delta < 0 ? 'গেছে' : 'ঢুকেছে'}: ${plus(cash)} = <b>${fmt(total(cash))}</b></p>` : ''
+      ].join('');
+      // Show the running balance of every account on the other side of this transaction.
+      const sides = r.link.other.map(m => `<p class="stmt-side">${esc(m.name)}: ${eq(m.x0, m.d, m.x1)}</p>`).join('');
+      return `<p class="stmt-link">${head}${gapNote}</p>${sums}${sides}`;
+    }
+    if (isLiab) return `<p class="muted">${r.delta > 0 ? 'বাকি বেড়েছে। নতুন মাল বা নতুন ধার।' : 'বাকি কমেছে। কোনো ব্যাংক থেকে সমান টাকা কমেনি।'}</p>`;
+    return `<p class="muted">${r.delta > 0 ? 'টাকা ঢুকেছে।' : 'টাকা বেরিয়েছে। কোনো সাপ্লায়ারের বাকি সমান কমেনি।'}</p>`;
+  };
+  const MAX = 300;
+  const shown = rows.slice(-MAX).reverse();
+  let lastDay = '';
+  const body = shown.map(r => {
+    const day = dkDate(new Date(r.ts));
+    const headRow = day !== lastDay ? `<div class="stmt-day">${esc(dt(r.ts).split(',')[0])}</div>` : '';
+    lastDay = day;
+    const time = dt(r.ts).split(', ')[1] || '';
+    return `${headRow}<div class="stmt-row ${r.delta > 0 ? 'up' : 'down'}"><div class="stmt-top"><span class="stmt-time">${esc(time)}</span><span class="stmt-eq">${eq(r.before, r.delta, r.after)}</span><b>${r.delta > 0 ? '▲' : '▼'} ${fmt(Math.abs(r.delta))}</b></div>${why(r)}</div>`;
+  }).join('');
+  const label = isLiab ? 'বাকি' : 'ব্যালান্স';
+  return `<h3>${esc(title)} · স্টেটমেন্ট</h3>
+    <div class="stmt-sum">
+      <div><span>শুরুতে (${esc(dt(first.ts))})</span><b>${fmt(open)}</b></div>
+      <div class="up"><span>মোট বেড়েছে</span><b>+ ${fmt(up)}</b></div>
+      <div class="down"><span>মোট কমেছে</span><b>− ${fmt(down)}</b></div>
+      <div><span>এখন ${label}</span><b>${fmt(now)}</b></div>
+    </div>
+    <p class="stmt-eq-all">${fmt(open)} + ${fmt(up)} − ${fmt(down)} = <b>${fmt(now)}</b></p>
+    ${rows.length ? body : `<p class="muted">শিটের ${snaps.length}টা সারিতে এই ${label} একবারও বদলায়নি।</p>`}
+    ${rows.length > MAX ? `<p class="muted">সবচেয়ে নতুন ${MAX}টা পরিবর্তন দেখানো হলো (মোট ${rows.length}টা)।</p>` : ''}
+    <p class="muted">Live Sheet-এর পরপর দুই সারির তুলনা থেকে বানানো। ${isLiab ? 'বাকি কমার সময় কোনো ব্যাংক/ক্যাশ ঘরে প্রায় সমান টাকা (৳১০ বা ২% পর্যন্ত) কমলে সেটাকে শোধ ধরা হয়েছে।' : 'টাকা কমার সময় কোনো সাপ্লায়ারের বাকি প্রায় সমান (৳১০ বা ২% পর্যন্ত) কমলে সেটাকে শোধ ধরা হয়েছে।'}</p>`;
+}
+
 const VIEWS = {
   overview() {
     const { cards, t } = kpiData();
@@ -3178,7 +3294,7 @@ const VIEWS = {
 
   balance() {
     const t = compute(), c = cfg();
-    const sec = (title, gs) => `<div class="card"><h3>${title}</h3><div class="tw"><table><tr><th>Item</th><th class="n">Original</th><th class="n">In ${c.base}</th><th>Status</th></tr>${t.parts.filter(p => gs.includes(p.it.group)).map(p => `<tr class="${p.inc ? '' : 'dim'}"><td>${esc(uiName(p.it.name))}</td><td class="n">${fmt(p.it.balance, p.it.currency)}</td><td class="n">${fmt(p.v)}</td><td>${p.inc ? '' : 'excluded'}</td></tr>`).join('')}</table></div></div>`;
+    const sec = (title, gs) => `<div class="card"><h3>${title}</h3><div class="tw"><table><tr><th>Item</th><th class="n">Original</th><th class="n">In ${c.base}</th><th>Status</th></tr>${t.parts.filter(p => gs.includes(p.it.group)).map(p => `<tr class="${p.inc ? '' : 'dim'}${stmtAttrs(p.it)}><td>${esc(uiName(p.it.name))}</td><td class="n">${fmt(p.it.balance, p.it.currency)}</td><td class="n">${fmt(p.v)}</td><td>${p.inc ? '' : 'excluded'}</td></tr>`).join('')}</table></div></div>`;
     return `<div class="grid"><div class="kpi"><h4>Total assets</h4><div class="v">${fmt(t.assets)}</div></div><div class="kpi"><h4>Total liabilities / dues</h4><div class="v">${fmt(t.liab)}</div></div><div class="kpi"><h4>Net worth</h4><div class="v">${fmt(t.nw)}</div></div></div>
     <div class="row2"><div>${sec('Cash & Accounts', ['cash'])}${sec('Courier Receivables', ['courier'])}${sec('Inventory & other assets', ['stock', 'otherAsset'])}</div><div>${sec('Supplier dues & other liabilities', ['supplier', 'otherLiab'])}${sec('Owner adjustment (equity)', ['owner'])}</div></div>`;
   },
@@ -3498,6 +3614,7 @@ document.addEventListener('click', async e => {
   try {
     if (a === 'navgroup') { window.__navGroup = window.__navGroup === b.dataset.g ? '' : b.dataset.g; render(true); }
     else if (a === 'kpi') { $('#modalBody').innerHTML = breakdown(b.dataset.k); $('#modal').classList.remove('hidden'); }
+    else if (a === 'stmt') { $('#modalBody').innerHTML = itemStatement(id); $('#modal').classList.remove('hidden'); $('#modal .modal-box')?.scrollTo?.(0, 0); }
     else if (a === 'closeModal') $('#modal').classList.add('hidden');
     else if (a === 'snapNow' || a === 'calculateNow') await calculateNow(true);
     else if (a === 'checkStock') await checkEcomdriveStock();

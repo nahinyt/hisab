@@ -183,3 +183,27 @@ svg.chart text{font-family:inherit}
   .flow-arrows{flex-direction:row;justify-content:center}
   .flow-arrows span{transform:rotate(90deg)}
 }
+
+/* Clickable supplier / bank rows → statement */
+tr.click-row{cursor:pointer}
+tr.click-row:hover td{background:var(--brand-soft)}
+tr.click-row td:first-child{color:var(--brand2);font-weight:600;text-decoration:underline dotted;text-underline-offset:3px}
+.stmt-sum{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin:10px 0}
+.stmt-sum>div{border:1px solid var(--line);border-radius:12px;padding:10px 12px;background:var(--card)}
+.stmt-sum span{display:block;font-size:12px;color:var(--muted)}
+.stmt-sum b{font-size:16px}
+.stmt-sum .up b{color:var(--green)}
+.stmt-sum .down b{color:var(--red)}
+.stmt-eq-all{font-size:14px;padding:8px 12px;border-radius:10px;background:var(--brand-soft);overflow-wrap:anywhere}
+.stmt-day{margin:16px 0 4px;font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.stmt-row{border-left:3px solid var(--line);padding:8px 0 8px 10px;border-bottom:1px solid var(--line)}
+.stmt-row.up{border-left-color:var(--green)}
+.stmt-row.down{border-left-color:var(--red)}
+.stmt-top{display:flex;flex-wrap:wrap;align-items:baseline;gap:6px 12px;font-size:13px}
+.stmt-time{color:var(--muted);min-width:64px}
+.stmt-eq{flex:1;min-width:0;overflow-wrap:anywhere}
+.stmt-row.up .stmt-top>b{color:var(--green)}
+.stmt-row.down .stmt-top>b{color:var(--red)}
+.stmt-row p{margin:4px 0 0;font-size:12.5px}
+.stmt-link{color:var(--brand2);font-weight:600}
+.stmt-side{color:var(--muted);overflow-wrap:anywhere}
