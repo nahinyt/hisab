@@ -279,6 +279,11 @@ tr.click-row td:first-child{color:var(--brand2);font-weight:600;text-decoration:
 .fwd-table td small{display:block}
 .fwd-row-btns{white-space:nowrap}
 .fwd-row-btns .btn+.btn{margin-left:4px}
+.fwd-courier-status{max-width:260px;font-size:12.5px;overflow-wrap:anywhere}
+.fwd-courier-status small{display:block;margin-top:2px}
+.fwd-track{margin:8px 0 0;padding-left:18px}
+.fwd-track li{margin:0 0 10px}
+.fwd-track small{display:block;margin-top:2px}
 .fwd-pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11.5px;font-weight:650;background:#eef2f6;white-space:nowrap}
 .fwd-pill.ok{background:#e7f8ee;color:var(--green)}
 .fwd-pill.fail{background:#fff1f0;color:var(--red)}

@@ -3306,11 +3306,18 @@ function fwdLiveHtml(st) {
     ? `${dt(lr.finished || lr.started)} · ${lr.fetched} orders (${esc(srcLabel)}) · ${lr.newIds} new${sentBits}${lr.error ? ` · <b class="neg">${esc(lr.error)}</b>` : ''}`
     : 'Never';
   const done = r => ['forwarded', 'exists'].includes(r.status);
+  const trackBtn = r => {
+    const shipped = String(r.ecom_status || '').toUpperCase() === 'SHIPPED' || /steadfast|packzy/i.test(String(r.courier || ''));
+    if (!shipped && !r.courier_status) return '';
+    return `<button class="btn sm" data-click="fwdTracking" data-id="${esc(r.invoice_id)}">Tracking</button>`;
+  };
   const rows = st.rows.map(r => `<tr>
       <td><b>${esc(r.invoice_id)}</b></td><td>${esc(r.phone)}</td><td>${esc(r.name)}</td><td>${esc(r.courier)}</td>
-      <td class="n">৳${Number(r.cod_amount || 0).toLocaleString('en-IN')}</td><td>${pill(r)}</td><td class="n">${r.attempts}</td>
+      <td class="n">৳${Number(r.cod_amount || 0).toLocaleString('en-IN')}</td><td>${pill(r)}</td>
+      <td class="fwd-courier-status">${r.courier_status ? esc(r.courier_status) : '<span class="muted">—</span>'}${r.ecom_status ? `<small class="muted">${esc(r.ecom_status)}</small>` : ''}</td>
+      <td class="n">${r.attempts}</td>
       <td>${r.last_attempt_at ? dt(r.last_attempt_at) : '<span class="muted">—</span>'}${r.next_retry_at && !done(r) ? `<small class="muted">retry ${dt(r.next_retry_at)}</small>` : ''}</td>
-      <td class="fwd-row-btns">${r.attempts ? `<button class="btn sm" data-click="fwdLog" data-id="${esc(r.invoice_id)}">Request</button>` : `<button class="btn sm" data-click="fwdPreview" data-id="${esc(r.invoice_id)}">Preview</button>`}${['failed', 'no_match', 'invalid'].includes(r.status) ? `<button class="btn sm" data-click="fwdRetryOne" data-id="${esc(r.invoice_id)}">Retry</button>` : ''}</td>
+      <td class="fwd-row-btns">${r.attempts ? `<button class="btn sm" data-click="fwdLog" data-id="${esc(r.invoice_id)}">Request</button>` : `<button class="btn sm" data-click="fwdPreview" data-id="${esc(r.invoice_id)}">Preview</button>`}${trackBtn(r)}${['failed', 'no_match', 'invalid'].includes(r.status) ? `<button class="btn sm" data-click="fwdRetryOne" data-id="${esc(r.invoice_id)}">Retry</button>` : ''}</td>
     </tr>`).join('');
   return `<div class="fwd-status">
       <span class="fwd-dot ${esc(c.state)}"></span><b>${esc(c.text)}</b>
@@ -3338,8 +3345,8 @@ function fwdLiveHtml(st) {
           <button class="btn sm" data-click="fwdRetry" data-which="failed" ${k.errors ? '' : 'disabled'}>Retry errors (${k.errors})</button>
         </div>
       </div>
-      <div class="tw"><table class="fwd-table"><tr><th>Invoice ID</th><th>Phone</th><th>Name</th><th>Courier</th><th class="n">COD</th><th>Status</th><th class="n">Tries</th><th>Last attempt</th><th></th></tr>
-      ${rows || '<tr><td colspan="9" class="muted">No invoices yet. Press “Sync now”.</td></tr>'}
+      <div class="tw"><table class="fwd-table"><tr><th>Invoice ID</th><th>Phone</th><th>Name</th><th>Courier</th><th class="n">COD</th><th>Status</th><th>Courier step</th><th class="n">Tries</th><th>Last attempt</th><th></th></tr>
+      ${rows || '<tr><td colspan="10" class="muted">No invoices yet. Press “Sync now”.</td></tr>'}
       </table></div>
     </div>`;
 }
@@ -3843,6 +3850,17 @@ document.addEventListener('click', async e => {
       $('#modalBody').innerHTML = `<h3>${esc(id)} · request preview</h3>
         <p class="muted">${p.configured ? 'এই invoice পাঠানোর সময় ঠিক এই request যাবে।' : 'API URL / key এখনো সেট নেই — body এরকম যাবে।'}</p>
         <div class="fwd-raw"><h5>Request <button class="btn sm" data-click="fwdCopy" data-target="reqPrev">Copy</button></h5><pre id="reqPrev">${esc(p.request)}</pre></div>`;
+      $('#modal').classList.remove('hidden');
+    }
+    else if (a === 'fwdTracking') {
+      const res = await api('/api/forwarder/tracking?invoice=' + encodeURIComponent(id), { timeoutMs: 20000 });
+      const p = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(p.error || 'Tracking failed');
+      const steps = Array.isArray(p.tracking) ? p.tracking.slice().sort((a, b) => (Date.parse(a.created_at || '') || 0) - (Date.parse(b.created_at || '') || 0)) : [];
+      const list = steps.map(s => `<li><b>${esc(s.text || '')}</b><small class="muted">${s.created_at ? dt(s.created_at) : '—'}${s.tracking_type != null ? ` · type ${esc(s.tracking_type)}` : ''}</small></li>`).join('');
+      $('#modalBody').innerHTML = `<h3>${esc(id)} · Steadfast tracking</h3>
+        <p class="muted">${p.packzyConfigured ? (p.courier_status ? 'Latest: ' + esc(p.courier_status) : 'No tracking steps yet.') : 'Packzy API keys not set in worker/.env.'}${p.liveError ? ' · Live refresh: ' + esc(p.liveError) : ''}${p.courier_tracked_at ? ' · Updated ' + dt(p.courier_tracked_at) : ''}</p>
+        <ol class="fwd-track">${list || '<li class="muted">No steps.</li>'}</ol>`;
       $('#modal').classList.remove('hidden');
     }
     else if (a === 'fwdCopy') {

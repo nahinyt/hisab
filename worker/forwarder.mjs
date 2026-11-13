@@ -5,6 +5,11 @@
 // 'forwarded' or 'exists' can never be claimed again, so it is never sent twice — across
 // rescans, page refreshes, restarts and overlapping runs.
 //
+// Per-status sending: an invoice is sent at most ONCE per Ecom Drive status (PENDING, SHIPPED, RTS).
+// sent_stages records the statuses already sent. When a finished invoice shows up under a status it was
+// never sent for (e.g. Pending → RTS), it goes back to the end of the queue for one more send with the
+// richer payload. The claim refuses a status that is already in sent_stages, so a status is never sent twice.
+//
 // Destination contract — PackKoro /api/ecomdrive/invoice (Authorization: Bearer <key>):
 //   200 + matched_orders > 0 → forwarded (done)    200 + duplicate/already_assigned_to → exists (done)
 //   200 + matched_orders = 0 → no_match ("Not matched"; never retried automatically, only by manual Retry)
@@ -15,6 +20,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { DatabaseSync } from 'node:sqlite';
 import { ecomGet } from './ecomdrive.mjs';
+import { packzyConfigured, trackingsByInvoice } from './steadfast-api.mjs';
 
 const workerDir = path.dirname(fileURLToPath(import.meta.url));
 const DONE = new Set(['forwarded', 'exists']);
@@ -23,7 +29,10 @@ const PAGE = 50;
 const SEND_TIMEOUT_MS = 15000;
 const IN_RUN_TRIES = 3;           // network/5xx retries inside one run: 1s, 2s
 const STALE_SENDING_MS = 10 * 60000;
+// Send queue: one request at a time, oldest-queued first, SEND_GAP_MS apart (PackKoro allows 60/min),
+// at most MAX_PER_RUN per sync; the rest wait for the next sync in the same order.
 const SEND_GAP_MS = Number(process.env.FORWARDER_SEND_GAP_MS ?? 1100);
+const MAX_PER_RUN = Math.max(1, Number(process.env.FORWARDER_MAX_PER_RUN ?? 200) || 200);
 
 let db = null;
 let dbPath = '';
@@ -74,8 +83,36 @@ export function openForwarder(file) {
     CREATE INDEX IF NOT EXISTS attempts_invoice ON attempts(invoice_id, id);
     CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL);
   `);
-  for (const col of ['request_url TEXT', 'request_body TEXT', 'duration_ms INTEGER']) {
+  for (const col of ['request_url TEXT', 'request_body TEXT', 'duration_ms INTEGER', 'stage TEXT']) {
     try { db.exec('ALTER TABLE attempts ADD COLUMN ' + col); } catch { /* already there */ }
+  }
+  for (const col of [
+    'ecom_status TEXT NOT NULL DEFAULT \'\'',
+    'courier_status TEXT NOT NULL DEFAULT \'\'',
+    'courier_tracking_json TEXT NOT NULL DEFAULT \'\'',
+    'courier_tracked_at TEXT',
+    'courier_code TEXT NOT NULL DEFAULT \'\'',
+    'tracking_id TEXT NOT NULL DEFAULT \'\'',
+    'consignment_id TEXT NOT NULL DEFAULT \'\'',
+    'public_tracking_token TEXT NOT NULL DEFAULT \'\'',
+    'skus_json TEXT NOT NULL DEFAULT \'[]\'',
+    // Per-status sending: ",PENDING,RTS," = already sent for those Ecom Drive statuses.
+    'sent_stages TEXT NOT NULL DEFAULT \'\'',
+    'stage TEXT NOT NULL DEFAULT \'\'',   // the status the current queue entry / last outcome is for
+    'queued_at TEXT'                       // serial order of the send queue
+  ]) {
+    try { db.exec('ALTER TABLE invoices ADD COLUMN ' + col); } catch { /* already there */ }
+  }
+  if (!db.prepare("SELECT v FROM kv WHERE k = 'stages_migrated'").get()) {
+    // Rows sent before per-status sending existed: we can't tell which status they went out as,
+    // so mark PENDING and their current status as sent (never a duplicate; at worst one stage is skipped).
+    db.exec(`
+      UPDATE invoices SET stage = COALESCE(NULLIF(ecom_status, ''), 'PENDING') WHERE stage = '';
+      UPDATE invoices SET sent_stages = ',PENDING,' || CASE WHEN ecom_status NOT IN ('', 'PENDING') THEN ecom_status || ',' ELSE '' END
+        WHERE status IN ('forwarded','exists') AND sent_stages = '';
+      UPDATE invoices SET queued_at = first_seen_at WHERE queued_at IS NULL;
+      INSERT INTO kv (k, v) VALUES ('stages_migrated', '1') ON CONFLICT(k) DO NOTHING;
+    `);
   }
   return db;
 }
@@ -186,13 +223,99 @@ export function mapEcomOrder(doc) {
     address,
     cod_amount: cod,
     courier: String(o.deliveryMethod?.name || o.deliveryMethod?.type || ''),
-    status: String(o.status || rec.currentStatus || '').toUpperCase()
+    status: String(o.status || rec.currentStatus || '').toUpperCase(),
+    skus: skusOf(o),
+    ...courierIdsOf(o)
   };
 }
 
-/** Exact destination body — these five fields, nothing else. */
+/** Every product SKU in the parcel (order.lines[]), in order, each once. */
+export function skusOf(o = {}) {
+  const lines = Array.isArray(o.lines) ? o.lines : [];
+  const out = [];
+  for (const ln of lines) {
+    const sku = String(ln?.sku || ln?.skuAtOrderTime || ln?.listProduct?.sku || ln?.product?.sku || '').trim();
+    if (sku && !out.includes(sku)) out.push(sku);
+  }
+  return out;
+}
+
+function parseSkus(json) {
+  try { const a = JSON.parse(json || '[]'); return Array.isArray(a) ? a.map(String) : []; } catch { return []; }
+}
+
+/**
+ * Courier IDs as Ecom Drive stores them.
+ *   Steadfast: couriers[].trackingId = "SFR…" tracking code, couriers[].consignmentId = numeric consignment ID.
+ *   Pathao:    couriers[].trackingId = "DP…" — this is Pathao's consignment ID (consignmentId is null there).
+ */
+export function courierIdsOf(o = {}) {
+  const lc = o.listCouriers || {};
+  const list = Array.isArray(o.couriers) ? o.couriers.filter(Boolean) : [];
+  const provider = String(list[0]?.provider || o.deliveryMethod?.type || '').toUpperCase();
+  const entry = list.find(x => String(x.provider || '').toUpperCase() === provider) || list[0] || {};
+  const s = v => String(v ?? '').trim();
+  if (provider === 'STEADFAST') {
+    return {
+      courier_code: 'steadfast',
+      tracking_id: s(entry.trackingId || lc.steadfast?.steadfastTrackingId),
+      consignment_id: s(entry.consignmentId || lc.steadfast?.consignmentId),
+      public_tracking_token: s(lc.steadfast?.publicTrackingToken)
+    };
+  }
+  if (provider === 'PATHAO') {
+    return {
+      courier_code: 'pathao',
+      tracking_id: '',
+      consignment_id: s(entry.consignmentId || entry.trackingId || lc.pathao?.pathaoTrackingId),
+      public_tracking_token: ''
+    };
+  }
+  return { courier_code: provider.toLowerCase(), tracking_id: s(entry.trackingId), consignment_id: s(entry.consignmentId), public_tracking_token: '' };
+}
+
+/**
+ * Public tracking page for one parcel, or null when the IDs are missing.
+ * Same links the Ecom Drive order list shows (its getCourierTrackingUrl).
+ */
+export function trackingLinkOf(row) {
+  if (row.courier_code === 'steadfast' && row.public_tracking_token) {
+    return 'https://steadfast.com.bd/tl/' + encodeURIComponent(row.public_tracking_token);
+  }
+  if (row.courier_code === 'steadfast' && row.tracking_id) {
+    return 'https://steadfast.com.bd/t/' + encodeURIComponent(row.tracking_id);
+  }
+  if (row.courier_code === 'pathao' && row.consignment_id) {
+    return 'https://merchant.pathao.com/tracking?consignment_id=' + encodeURIComponent(row.consignment_id)
+      + (row.phone ? '&phone=' + encodeURIComponent(row.phone) : '');
+  }
+  return null;
+}
+
+/**
+ * Destination body.
+ *   PENDING      → the original five fields + order_status + skus.
+ *   SHIPPED/RTS  → the same five + order_status, courier and the courier's IDs + tracking_link.
+ *                  Steadfast: tracking_id + consignment_id.  Pathao: consignment_id only.
+ */
 export function payloadOf(row) {
-  return { phone: row.phone, name: row.name, address: row.address, cod_amount: row.cod_amount, invoice_id: row.invoice_id };
+  const skus = Array.isArray(row.skus) ? row.skus : parseSkus(row.skus_json);
+  const base = { phone: row.phone, name: row.name, address: row.address, cod_amount: row.cod_amount, invoice_id: row.invoice_id };
+  const st = String(row.ecom_status || '').toUpperCase();
+  if (st !== 'SHIPPED' && st !== 'RTS') return { ...base, order_status: st || 'PENDING', skus };
+  const out = { ...base, order_status: st, courier: row.courier_code || String(row.courier || '').toLowerCase() || null };
+  if (row.courier_code === 'steadfast') {
+    out.tracking_id = row.tracking_id || null;
+    out.consignment_id = row.consignment_id || null;
+  } else if (row.courier_code === 'pathao') {
+    out.consignment_id = row.consignment_id || null;
+  } else {
+    if (row.tracking_id) out.tracking_id = row.tracking_id;
+    if (row.consignment_id) out.consignment_id = row.consignment_id;
+  }
+  out.tracking_link = trackingLinkOf(row);
+  out.skus = skus;
+  return out;
 }
 
 // ---------- source: Ecom Drive (read-only) ----------
@@ -231,39 +354,158 @@ export async function fetchPendingFromEcomDrive() {
 }
 
 // ---------- discovery ----------
+function isSteadfastCourier(courier) {
+  return /steadfast|packzy/i.test(String(courier || ''));
+}
+
+function needsCourierTracking(row) {
+  if (!row?.invoice_id) return false;
+  if (String(row.ecom_status || '').toUpperCase() === 'SHIPPED') return true;
+  return isSteadfastCourier(row.courier);
+}
+
+/** Ecom Drive status an invoice is sent "as". Each invoice is sent at most once per stage. */
+export function stageOf(rowOrStatus) {
+  const s = typeof rowOrStatus === 'string' ? rowOrStatus : rowOrStatus?.ecom_status;
+  return String(s || '').toUpperCase() || 'PENDING';
+}
+function stageSent(sentStages, stage) {
+  return String(sentStages || '').includes(',' + stage + ',');
+}
+
 function upsertSeen(order, at) {
   const phone = normalizePhone(order.phone_raw);
+  const ecomStatus = String(order.status || '').toUpperCase();
+  const stage = stageOf(ecomStatus);
   const invalid = !validInvoiceId(order.invoice_id) ? 'Invalid invoice ID'
     : !phone ? 'Invalid phone number'
       : !order.name ? 'Missing customer name'
         : !order.address ? 'Missing address'
           : order.cod_amount == null ? 'Missing COD amount' : '';
-  const existing = d().prepare('SELECT status FROM invoices WHERE invoice_id = ?').get(order.invoice_id);
+  const existing = d().prepare('SELECT status, stage, sent_stages FROM invoices WHERE invoice_id = ?').get(order.invoice_id);
+  const skusJson = Array.isArray(order.skus) && order.skus.length ? JSON.stringify(order.skus) : '';
+  const ids = [order.courier_code || '', order.tracking_id || '', order.consignment_id || '', order.public_tracking_token || '', skusJson];
+  // Courier IDs / SKUs only ever fill in / change, never get wiped by a scan that lacks them.
+  const saveIds = () => d().prepare(`UPDATE invoices SET
+      courier_code = CASE WHEN ? != '' THEN ? ELSE courier_code END,
+      tracking_id = CASE WHEN ? != '' THEN ? ELSE tracking_id END,
+      consignment_id = CASE WHEN ? != '' THEN ? ELSE consignment_id END,
+      public_tracking_token = CASE WHEN ? != '' THEN ? ELSE public_tracking_token END,
+      skus_json = CASE WHEN ? != '' THEN ? ELSE skus_json END
+    WHERE invoice_id = ? AND status != 'sending'`).run(ids[0], ids[0], ids[1], ids[1], ids[2], ids[2], ids[3], ids[3], ids[4], ids[4], order.invoice_id);
   if (!existing) {
-    d().prepare(`INSERT INTO invoices (invoice_id, phone, name, address, cod_amount, courier, status, first_seen_at, last_seen_at, last_message)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(invoice_id) DO NOTHING`)
-      .run(order.invoice_id, phone, order.name, order.address, order.cod_amount ?? 0, order.courier, invalid ? 'invalid' : 'new', at, at, invalid);
+    d().prepare(`INSERT INTO invoices (invoice_id, phone, name, address, cod_amount, courier, status, first_seen_at, last_seen_at, last_message, ecom_status, courier_code, tracking_id, consignment_id, public_tracking_token, skus_json, stage, queued_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(invoice_id) DO NOTHING`)
+      .run(order.invoice_id, phone, order.name, order.address, order.cod_amount ?? 0, order.courier, invalid ? 'invalid' : 'new', at, at, invalid, ecomStatus, ...ids.slice(0, 4), skusJson || '[]', stage, at);
     return { isNew: true, done: false };
   }
+  saveIds();
+  const finishedForStage = DONE.has(existing.status) || existing.status === 'no_match';
+  if (finishedForStage && existing.stage !== stage && !stageSent(existing.sent_stages, stage)) {
+    // Moved to a status it was never sent for (Pending → Shipped / RTS): one new send, at the back of the queue.
+    d().prepare(`UPDATE invoices SET phone = ?, name = ?, address = ?, cod_amount = ?, courier = ?, ecom_status = ?, stage = ?,
+        last_seen_at = ?, seen_count = seen_count + 1, queued_at = ?, attempts = 0, next_retry_at = NULL, last_http = NULL,
+        status = CASE WHEN ? != '' THEN 'invalid' ELSE 'new' END,
+        last_message = CASE WHEN ? != '' THEN ? ELSE ? END
+      WHERE invoice_id = ? AND status IN ('forwarded','exists','no_match')`)
+      .run(phone, order.name, order.address, order.cod_amount ?? 0, order.courier, ecomStatus, stage, at, at,
+        invalid, invalid, invalid, 'Status changed to ' + stage + ' — queued to send again', order.invoice_id);
+    return { isNew: false, done: false, requeued: true };
+  }
   if (DONE.has(existing.status)) {
-    // Finished rows are frozen: only note that we saw it again.
-    d().prepare('UPDATE invoices SET last_seen_at = ?, seen_count = seen_count + 1 WHERE invoice_id = ?').run(at, order.invoice_id);
+    // Finished rows are frozen: only note that we saw it again + refresh ecom/courier labels.
+    d().prepare('UPDATE invoices SET last_seen_at = ?, seen_count = seen_count + 1, ecom_status = CASE WHEN ? != \'\' THEN ? ELSE ecom_status END, courier = CASE WHEN ? != \'\' THEN ? ELSE courier END WHERE invoice_id = ?')
+      .run(at, ecomStatus, ecomStatus, order.courier || '', order.courier || '', order.invoice_id);
     return { isNew: false, done: true };
   }
   // Not finished yet: refresh customer data from the latest scan (an edit in Ecom Drive should be sent).
-  d().prepare(`UPDATE invoices SET phone = ?, name = ?, address = ?, cod_amount = ?, courier = ?, last_seen_at = ?, seen_count = seen_count + 1,
-      status = CASE WHEN ? != '' THEN 'invalid' WHEN status = 'invalid' THEN 'new' ELSE status END,
-      last_message = CASE WHEN ? != '' THEN ? WHEN status = 'invalid' THEN '' ELSE last_message END
+  // A still-queued row whose status moved to one it was already sent for has nothing left to send.
+  const already = stageSent(existing.sent_stages, stage) ? 1 : 0;
+  d().prepare(`UPDATE invoices SET phone = ?, name = ?, address = ?, cod_amount = ?, courier = ?, ecom_status = ?, stage = ?, last_seen_at = ?, seen_count = seen_count + 1,
+      status = CASE WHEN ? = 1 THEN 'exists' WHEN ? != '' THEN 'invalid' WHEN status = 'invalid' THEN 'new' ELSE status END,
+      last_message = CASE WHEN ? = 1 THEN 'Already sent as ' || ? WHEN ? != '' THEN ? WHEN status = 'invalid' THEN '' ELSE last_message END
     WHERE invoice_id = ? AND status NOT IN ('forwarded','exists','sending')`)
-    .run(phone, order.name, order.address, order.cod_amount ?? 0, order.courier, at, invalid, invalid, invalid, order.invoice_id);
-  return { isNew: false, done: false };
+    .run(phone, order.name, order.address, order.cod_amount ?? 0, order.courier, ecomStatus, stage, at, already, invalid, already, stage, invalid, invalid, order.invoice_id);
+  return { isNew: false, done: !!already };
+}
+
+const TRACK_GAP_MS = 200;
+const TRACK_CAP = 80;
+
+function saveCourierTracking(invoiceId, payload) {
+  const steps = Array.isArray(payload.tracking) ? payload.tracking.slice(-40) : [];
+  d().prepare(`UPDATE invoices SET courier_status = ?, courier_tracking_json = ?, courier_tracked_at = ? WHERE invoice_id = ?`)
+    .run(payload.text || '', JSON.stringify(steps), now(), invoiceId);
+}
+
+/** Pull Packzy tracking for Steadfast / Shipped invoices. Missing keys → no-op. */
+export async function refreshCourierTracking({ invoiceIds = null, limit = TRACK_CAP } = {}) {
+  if (!packzyConfigured()) return { ok: false, skipped: true, reason: 'Packzy keys not set', updated: 0 };
+  let rows;
+  if (Array.isArray(invoiceIds) && invoiceIds.length) {
+    const uniq = [...new Set(invoiceIds.map(String).filter(Boolean))].slice(0, limit);
+    rows = uniq.map(id => d().prepare('SELECT invoice_id, courier, ecom_status FROM invoices WHERE invoice_id = ?').get(id)).filter(Boolean);
+  } else {
+    rows = d().prepare(`SELECT invoice_id, courier, ecom_status FROM invoices
+      WHERE ecom_status = 'SHIPPED' OR LOWER(courier) LIKE '%steadfast%' OR LOWER(courier) LIKE '%packzy%'
+      ORDER BY COALESCE(courier_tracked_at, '') ASC, last_seen_at DESC LIMIT ?`).all(Math.min(TRACK_CAP, limit));
+  }
+  let updated = 0;
+  let errors = 0;
+  for (const row of rows) {
+    if (!needsCourierTracking(row)) continue;
+    try {
+      const payload = await trackingsByInvoice(row.invoice_id);
+      saveCourierTracking(row.invoice_id, payload);
+      updated += 1;
+    } catch {
+      errors += 1;
+    }
+    await sleep(TRACK_GAP_MS);
+  }
+  return { ok: true, updated, errors, checked: rows.length };
+}
+
+/** Cached timeline + optional live Packzy refresh for one invoice. */
+export async function getCourierTracking(invoiceId, { live = true } = {}) {
+  const id = String(invoiceId || '').trim();
+  if (!id) throw new Error('Invoice ID required');
+  const row = d().prepare('SELECT invoice_id, courier, ecom_status, courier_status, courier_tracking_json, courier_tracked_at FROM invoices WHERE invoice_id = ?').get(id);
+  if (!row) throw new Error('Invoice not found');
+  let tracking = [];
+  try { tracking = JSON.parse(row.courier_tracking_json || '[]'); } catch { tracking = []; }
+  if (!Array.isArray(tracking)) tracking = [];
+  let liveError = '';
+  if (live && packzyConfigured()) {
+    try {
+      const payload = await trackingsByInvoice(id);
+      saveCourierTracking(id, payload);
+      tracking = payload.tracking;
+      row.courier_status = payload.text;
+      row.courier_tracked_at = now();
+    } catch (err) {
+      liveError = err.message || String(err);
+    }
+  }
+  return {
+    invoice_id: id,
+    courier: row.courier,
+    ecom_status: row.ecom_status,
+    courier_status: row.courier_status || '',
+    courier_tracked_at: row.courier_tracked_at || null,
+    tracking,
+    packzyConfigured: packzyConfigured(),
+    liveError: liveError || undefined
+  };
 }
 
 // ---------- sending ----------
 function claim(invoiceId, at) {
   // Only one caller can move a row into 'sending'; finished rows can never be claimed.
+  // A row is also never claimed for a status (stage) it was already sent for.
   const r = d().prepare(`UPDATE invoices SET status = 'sending', claimed_at = ?
-    WHERE invoice_id = ? AND status IN ('new','failed','no_match')`).run(at, invoiceId);
+    WHERE invoice_id = ? AND status IN ('new','failed','no_match')
+      AND instr(sent_stages, ',' || COALESCE(NULLIF(ecom_status, ''), 'PENDING') || ',') = 0`).run(at, invoiceId);
   return r.changes === 1;
 }
 
@@ -331,13 +573,15 @@ function backoffMin(attempts) {
 async function sendOne(row, settings) {
   const at = now();
   if (!claim(row.invoice_id, at)) return 'skipped';
+  row = d().prepare('SELECT * FROM invoices WHERE invoice_id = ?').get(row.invoice_id) || row; // latest data, as claimed
+  const stage = stageOf(row);
   const body = payloadOf(row);
   let got = null, cls = null;
   for (let i = 0; i < IN_RUN_TRIES; i++) {
     got = await postOnce(settings.apiUrl, settings.apiKey, body);
     cls = got.status == null ? { state: 'failed', why: got.text, transient: true } : classify(got.status, got.text);
-    d().prepare('INSERT INTO attempts (invoice_id, at, http_status, result, response, request_url, request_body, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(row.invoice_id, now(), got.status, cls.state, scrub(got.text, settings.apiKey), settings.apiUrl, JSON.stringify(body), got.ms ?? null);
+    d().prepare('INSERT INTO attempts (invoice_id, at, http_status, result, response, request_url, request_body, duration_ms, stage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(row.invoice_id, now(), got.status, cls.state, scrub(got.text, settings.apiKey), settings.apiUrl, JSON.stringify(body), got.ms ?? null, stage);
     if (!(cls.state === 'failed' && cls.transient) || i === IN_RUN_TRIES - 1) break;
     await sleep(cls.wait || 1000 * 2 ** i);
   }
@@ -348,10 +592,12 @@ async function sendOne(row, settings) {
   // Not matched: never retried automatically — only the manual Retry button sends it again.
   if (cls.state === 'no_match') next = null;
   else if (cls.state === 'failed' && !cls.rejected) next = new Date(Date.now() + backoffMin(attempts) * 60000).toISOString();
+  const doneNow = DONE.has(cls.state) ? 1 : 0;
   d().prepare(`UPDATE invoices SET status = ?, attempts = ?, last_attempt_at = ?, last_http = ?, last_message = ?, next_retry_at = ?,
-      forwarded_at = CASE WHEN ? IN ('forwarded','exists') THEN ? ELSE forwarded_at END, claimed_at = NULL
+      forwarded_at = CASE WHEN ? = 1 THEN ? ELSE forwarded_at END, claimed_at = NULL, stage = ?,
+      sent_stages = CASE WHEN ? = 1 THEN (CASE WHEN sent_stages = '' THEN ',' ELSE sent_stages END) || ? || ',' ELSE sent_stages END
     WHERE invoice_id = ? AND status = 'sending'`)
-    .run(cls.state, attempts, fin, got.status, msg, next, cls.state, fin, row.invoice_id);
+    .run(cls.state, attempts, fin, got.status, '[' + stage + '] ' + msg, next, doneNow, fin, stage, doneNow, stage, row.invoice_id);
   if (DONE.has(cls.state)) kvSet('last_success_at', fin);
   return cls.state;
 }
@@ -381,11 +627,20 @@ export async function runSync({ trigger = 'auto' } = {}) {
         seen.add(o.invoice_id);
         const r = upsertSeen(o, at);
         if (r.isNew) summary.newIds++;
+        if (r.requeued) summary.requeued = (summary.requeued || 0) + 1;
         if (r.done) summary.skippedDone++;
       }
       kvAdd('orders_discovered', summary.fetched);
       kvAdd('duplicates_skipped', summary.skippedDone);
       kvSet('last_sync_at', now());
+
+      // Steadfast Packzy: refresh courier timeline for Shipped / Steadfast invoices (skip if keys missing).
+      try {
+        const track = await refreshCourierTracking({ limit: TRACK_CAP });
+        if (!track.skipped) summary.tracking = { updated: track.updated, errors: track.errors, checked: track.checked };
+      } catch (err) {
+        summary.tracking = { error: err.message || String(err) };
+      }
 
       const settings = getSettings({ withKey: true });
       if (!settings.apiUrl || !settings.apiKey) {
@@ -393,7 +648,7 @@ export async function runSync({ trigger = 'auto' } = {}) {
       } else {
         // Not-matched rows are never picked up here; a manual Retry moves them back to 'new'.
         const due = d().prepare(`SELECT * FROM invoices WHERE status IN ('new','failed')
-            AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY first_seen_at LIMIT 200`).all(now());
+            AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY COALESCE(queued_at, first_seen_at), invoice_id LIMIT ?`).all(now(), MAX_PER_RUN);
         let lastSend = 0;
         for (const row of due) {
           // PackKoro allows 60 requests/minute per IP: keep sends ~1.1s apart.
@@ -464,7 +719,7 @@ export function forwarderStatus({ filter = '', search = '', limit = 200 } = {}) 
   if (FILTERS[filter]) where.push('status IN ' + FILTERS[filter]);
   if (search) { where.push('(invoice_id LIKE ? OR phone LIKE ? OR name LIKE ?)'); args.push(`%${search}%`, `%${search}%`, `%${search}%`); }
   const rows = d().prepare(`SELECT invoice_id, phone, name, courier, cod_amount, status, attempts, last_attempt_at, last_http, last_message,
-      first_seen_at, last_seen_at, next_retry_at, forwarded_at FROM invoices ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      first_seen_at, last_seen_at, next_retry_at, forwarded_at, ecom_status, courier_status, courier_tracked_at, stage, sent_stages, queued_at FROM invoices ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
       ORDER BY COALESCE(last_attempt_at, first_seen_at) DESC LIMIT ?`).all(...args, Math.min(500, limit));
   let lastRun = null;
   try { lastRun = JSON.parse(kvGet('last_run') || 'null'); } catch { /* ignore */ }
@@ -481,7 +736,7 @@ export function forwarderStatus({ filter = '', search = '', limit = 200 } = {}) 
 
 export function attemptLog(invoiceId) {
   const s = getSettings();
-  const rows = d().prepare('SELECT at, http_status, result, response, request_url, request_body, duration_ms FROM attempts WHERE invoice_id = ? ORDER BY id DESC LIMIT 50').all(invoiceId);
+  const rows = d().prepare('SELECT at, http_status, result, response, request_url, request_body, duration_ms, stage FROM attempts WHERE invoice_id = ? ORDER BY id DESC LIMIT 50').all(invoiceId);
   return rows.map(r => ({ ...r, request: rawRequest(r.request_url, r.request_body, s.keyMask) }));
 }
 
