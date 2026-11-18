@@ -467,8 +467,11 @@ export function checkDollar() {
 async function runSuppliers() {
   console.log('checking EcomDrive active suppliers');
   const suppliers = (await collectCursor('/suppliers', s => {
+    // Include brand-new suppliers even when due is 0 — previously !(due > 0)
+    // hid them from Hisab until the first unpaid bill.
+    if (s.isActive === false || !s.name) return null;
     const due = Number(s.summary?.totalDue ?? s.totalDue ?? 0);
-    if (s.isActive === false || !(due > 0)) return null;
+    if (!Number.isFinite(due) || due < 0) return null;
     return {
       id: s.id,
       name: s.name,

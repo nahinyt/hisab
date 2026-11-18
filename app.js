@@ -3851,7 +3851,7 @@ for (const [pg, groups] of Object.entries(PAGES)) {
         <button class="btn primary">Save</button>
       </form></div>` : '';
     const supBtn = pg === 'suppliers' && g === 'supplier' ? `<div class="card"><h3>EcomDrive suppliers</h3>
-      <p class="muted">Sync updates each supplier’s <b>Balance</b> and keeps <b>Previous</b> as the last amount (never wipes to zero). Inactive / missing suppliers keep their last due. Adds a new Live Sheet row. <b>USDT DUE</b> stays manual — sync does not create or change it.</p>
+      <p class="muted">Sync pulls every <b>active</b> EcomDrive supplier (including new ones with ৳0 due). Updates <b>Balance</b>, keeps <b>Previous</b>. Inactive ones keep last due. Adds a Live Sheet row. <b>USDT DUE</b> stays manual.</p>
       <button class="btn primary" data-click="checkSuppliers" ${window.__supBusy ? 'disabled' : ''}>${window.__supBusy ? 'Syncing…' : 'Sync supplier dues'}</button>
       ${window.__supMsg ? `<p class="muted">${esc(window.__supMsg)}</p>` : ''}${window.__supErr ? `<p class="err">${esc(window.__supErr)}</p>` : ''}</div>` : '';
     const head = `<th>Name</th><th>Cur</th><th class="n">Balance</th><th class="n">Previous</th><th class="n">Change</th><th>Source</th><th>Count</th><th></th>`;
