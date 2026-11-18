@@ -51,6 +51,16 @@ function rememberJwt(jwt) {
   clerkState.exp = readExp(jwt) || Date.now() + 50 * 1000;
 }
 
+/** Drop every Clerk cookie/session so the next call must password-login from .env. */
+function invalidateClerkSession(reason = '') {
+  if (reason) console.log('EcomDrive session cleared: ' + reason);
+  clerkState.jar = new Map();
+  clerkState.sessionId = '';
+  clerkState.jwt = '';
+  clerkState.exp = 0;
+  clerkState.businessId = '';
+}
+
 function takeCookies(res) {
   const list = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
   for (const c of list) {
@@ -58,6 +68,14 @@ function takeCookies(res) {
     const i = pair.indexOf('=');
     if (i > 0) clerkState.jar.set(pair.slice(0, i).trim(), pair.slice(i + 1).trim());
   }
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+function isAuthDeath(msg) {
+  return /sign.?in|session|unauthor|forbidden|logged out|signed out|not found|expired|invalid|401|403/i.test(String(msg || ''));
 }
 
 async function clerkCall(pathname, body) {
@@ -90,17 +108,18 @@ async function clerkCall(pathname, body) {
   }
 }
 
-async function passwordLogin() {
+/** Fresh Clerk password login using ECOMDRIVE_EMAIL / ECOMDRIVE_PASSWORD — no browser cookies. */
+async function passwordLoginOnce() {
   if (!EMAIL || !PASSWORD) throw new Error('Set ECOMDRIVE_EMAIL and ECOMDRIVE_PASSWORD in worker/.env');
   console.log('signing in to EcomDrive');
   sub('EcomDrive-এ লগইন করছি (ইমেইল + পাসওয়ার্ড)');
-  const html = await fetch(BASE + '/sign-in').then(r => r.text());
-  if (!/pk_(?:live|test)_/.test(html)) throw new Error('EcomDrive sign-in page did not load');
-  clerkState.jar = new Map();
-  clerkState.sessionId = '';
-  clerkState.jwt = '';
-  clerkState.exp = 0;
-  clerkState.businessId = '';
+  // EcomDrive SPA no longer embeds pk_live in HTML; reachability is enough.
+  const probe = await fetch(BASE + '/sign-in', { redirect: 'follow' });
+  const html = await probe.text().catch(() => '');
+  if (!probe.ok || (!/ecomdrive|clerk|sign-in/i.test(html) && html.length < 200)) {
+    throw new Error('EcomDrive sign-in page did not load (HTTP ' + probe.status + ')');
+  }
+  invalidateClerkSession();
   await clerkCall('/v1/client');
   const started = await clerkCall('/v1/client/sign_ins', { identifier: EMAIL });
   const signInId = started?.response?.id;
@@ -109,8 +128,12 @@ async function passwordLogin() {
     strategy: 'password',
     password: PASSWORD
   });
-  if (attempt?.response?.status !== 'complete') {
-    throw new Error('EcomDrive asked for an extra code. Sign in once in a browser, then try the check again.');
+  const status = attempt?.response?.status;
+  if (status !== 'complete') {
+    if (status === 'needs_second_factor' || /second.?factor|extra code|verification/i.test(status || '')) {
+      throw new Error('EcomDrive requires 2FA. Turn off 2FA for this login email, or use an app password — production cannot enter codes.');
+    }
+    throw new Error('EcomDrive sign-in incomplete (' + (status || 'unknown') + '). Check ECOMDRIVE_EMAIL / ECOMDRIVE_PASSWORD on the server.');
   }
   const session = (attempt?.client?.sessions || []).find(s => s.last_active_token?.jwt);
   const jwt = session?.last_active_token?.jwt;
@@ -119,6 +142,26 @@ async function passwordLogin() {
   rememberJwt(jwt);
   done('লগইন সফল');
   return clerkState.jwt;
+}
+
+async function passwordLogin() {
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await passwordLoginOnce();
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err?.message || err);
+      console.log('EcomDrive password login attempt ' + attempt + ' failed: ' + msg);
+      invalidateClerkSession('login attempt ' + attempt + ' failed');
+      // Do not retry hard credential / 2FA failures.
+      if (/ECOMDRIVE_EMAIL|ECOMDRIVE_PASSWORD|2FA|second.?factor|incomplete|did not start/i.test(msg) && !/timed out|fetch|network|HTTP 5/i.test(msg)) {
+        break;
+      }
+      if (attempt < 3) await sleep(800 * attempt);
+    }
+  }
+  throw lastErr || new Error('EcomDrive sign-in failed');
 }
 
 async function refreshJwt() {
@@ -134,20 +177,34 @@ async function refreshJwt() {
   } catch (err) {
     const msg = String(err?.message || '');
     console.log(msg.startsWith('Clerk HTTP') ? 'EcomDrive session refresh failed: ' + msg : 'EcomDrive session refresh failed');
+    if (isAuthDeath(msg)) invalidateClerkSession('refresh rejected');
     return '';
   }
 }
 
-async function getJwt() {
-  if (clerkState.jwt && clerkState.exp - 15000 > Date.now()) {
+/**
+ * Prefer live JWT → refresh Clerk session → password login from .env.
+ * Production never needs hand-pasted cookies; credentials in worker/.env are enough.
+ */
+async function getJwt(forcePassword = false) {
+  if (!forcePassword && clerkState.jwt && clerkState.exp - 15000 > Date.now()) {
     const row = progressRow();
     if (row && !sessionNoted.has(row)) { sessionNoted.add(row); note('EcomDrive-এ লগইন আছে — আবার লগইন লাগেনি'); }
     return clerkState.jwt;
   }
+  if (forcePassword && signingIn) {
+    try { await signingIn; } catch { /* previous attempt may have failed */ }
+  }
   if (!signingIn) {
+    const mustPassword = forcePassword;
     signingIn = (async () => {
-      const refreshed = await refreshJwt();
-      if (refreshed) return refreshed;
+      if (!mustPassword) {
+        const refreshed = await refreshJwt();
+        if (refreshed) return refreshed;
+      } else {
+        invalidateClerkSession('forced re-login');
+      }
+      note('সেশন নেই বা মেয়াদ শেষ — সার্ভার থেকে আবার লগইন করছি', 'warn');
       return passwordLogin();
     })().finally(() => { signingIn = null; });
   }
@@ -202,11 +259,8 @@ async function api(pathname, query) {
   let res = await fetch(url, { headers: authHeaders(jwt) });
   if (res.status === 401 || res.status === 403) {
     done('সেশনের মেয়াদ শেষ', 'warn');
-    note('আগের সেশন আর কাজ করছে না — নতুন করে লগইন করছি', 'warn');
-    clerkState.jwt = '';
-    clerkState.exp = 0;
-    clerkState.businessId = '';
-    const jwt2 = await getJwt();
+    note('আগের সেশন আর কাজ করছে না — .env দিয়ে সার্ভার থেকে আবার লগইন করছি', 'warn');
+    const jwt2 = await getJwt(true);
     const businessId2 = await ensureBusinessId(jwt2);
     sub(pageLabel(pathname));
     res = await fetch(`${BASE}/api/app/v1/businesses/${businessId2}${pathname}${qs}`, { headers: authHeaders(jwt2) });
