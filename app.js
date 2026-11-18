@@ -357,7 +357,10 @@ async function snapshot(source = 'auto') {
   const id = await cloudAdd('snapshots', row, 10000);
   if (!id) throw new Error(window.__cloudErr || 'Could not save Live Sheet row');
   if (!S.snapshots.some(s => s.id === id)) S.snapshots.push({ id, ...row });
-  if (source !== 'open') await absorbCountFix();
+  if (source !== 'open') {
+    await absorbCountFix();
+    await absorbBounceBack();
+  }
 }
 /** Wipe every Live Sheet row (keeps accounts/balances) and write one fresh opening row. */
 async function clearLiveSheet() {
@@ -436,16 +439,128 @@ function isCountFix(older, mid, last) {
 }
 async function absorbCountFix() {
   if (!LOADED.snapshots || S.snapshots.length < 3) return;
+  const distinct = distinctSnaps();
+  if (distinct.length < 3) return;
+  const mid = distinct[distinct.length - 2];
+  if (!isCountFix(distinct[distinct.length - 3], mid, distinct[distinct.length - 1])) return;
+  await A.del('snapshots', mid.id);
+  S.snapshots = S.snapshots.filter(s => s.id !== mid.id);
+  persistSnapshotMirror(S.snapshots);
+}
+/** ৳1000 BDT — balances are stored in minor units (paisa = taka × 100). */
+const BOUNCE_TAKA = 1000;
+const BOUNCE_THRESHOLD_MINOR = BOUNCE_TAKA * 100;
+const BOUNCE_MATCH_TOL_MINOR = 100; // ৳1
+function distinctSnaps() {
   const distinct = [];
   for (const s of sortedSnaps()) {
     const prev = distinct[distinct.length - 1];
     if (prev && prev.totals?.nw === s.totals?.nw && sameSnapValues(prev, s)) continue;
     distinct.push(s);
   }
+  return distinct;
+}
+function snapVal(snap, id) {
+  const v = snap?.values?.[id];
+  return v == null ? 0 : Number(v) || 0;
+}
+function applySnapValueDelta(totals, name, id, delta) {
+  const t = { ...(totals || {}) };
+  const it = S.items.find(i => i.id === id);
+  const group = it?.group
+    || (ECOM_SALE.has(name) ? 'metric'
+      : /^Pathao · |^Steadfast · /.test(name) ? 'courier'
+        : name === 'Total Stock Value' ? 'stock'
+          : isUsdtDue({ id, name }) || /due/i.test(name) ? 'supplier' : '');
+  if (ECOM_SALE.has(name) || group === 'metric') {
+    t.nw = (t.nw || 0) + delta;
+  } else if (group === 'cash' || group === 'courier' || group === 'stock' || group === 'otherAsset') {
+    if (group !== 'otherAsset') t[group] = (t[group] || 0) + delta;
+    t.assets = (t.assets || 0) + delta;
+    t.nw = (t.nw || 0) + delta;
+  } else if (group === 'supplier' || group === 'otherLiab') {
+    t.supplier = (t.supplier || 0) + delta;
+    t.liab = (t.liab || 0) + delta;
+    t.nw = (t.nw || 0) - delta;
+  } else if (group === 'owner') {
+    t.owner = (t.owner || 0) + delta;
+    if (cfg().ownerInNetWorth) t.nw = (t.nw || 0) + delta;
+  }
+  return t;
+}
+/**
+ * When a cell swings by more than ৳1000 then reverses by the same amount on the next row,
+ * push the reverse onto the earlier row so books do not show fake profit then fake loss.
+ */
+async function absorbBounceBack() {
+  if (!LOADED.snapshots || S.snapshots.length < 3) return;
+  const distinct = distinctSnaps();
   if (distinct.length < 3) return;
-  const mid = distinct[distinct.length - 2];
-  if (!isCountFix(distinct[distinct.length - 3], mid, distinct[distinct.length - 1])) return;
-  await A.del('snapshots', mid.id);
+  const older = distinct[distinct.length - 3];
+  const prev = distinct[distinct.length - 2];
+  const curr = distinct[distinct.length - 1];
+  const ids = new Set([
+    ...Object.keys(older.values || {}),
+    ...Object.keys(prev.values || {}),
+    ...Object.keys(curr.values || {})
+  ]);
+  let values = { ...(prev.values || {}) };
+  let totals = { ...(prev.totals || {}) };
+  let changed = false;
+  for (const id of ids) {
+    const a = snapVal(older, id), b = snapVal(prev, id), c = snapVal(curr, id);
+    const d1 = b - a, d2 = c - b;
+    if (!d1 || !d2) continue;
+    if (Math.sign(d1) === Math.sign(d2)) continue;
+    if (Math.abs(d1) <= BOUNCE_THRESHOLD_MINOR) continue;
+    if (Math.abs(Math.abs(d1) - Math.abs(d2)) > BOUNCE_MATCH_TOL_MINOR) continue;
+    const apply = d2;
+    if (prev.values?.[id] == null && b + apply === 0) delete values[id];
+    else values[id] = b + apply;
+    const name = prev.names?.[id] || curr.names?.[id] || older.names?.[id] || S.items.find(i => i.id === id)?.name || '';
+    totals = applySnapValueDelta(totals, name, id, apply);
+    changed = true;
+  }
+  if (!changed) return;
+  await cloudSet('snapshots', prev.id, { values, totals }, 8000);
+  const i = S.snapshots.findIndex(s => s.id === prev.id);
+  if (i >= 0) S.snapshots[i] = { ...S.snapshots[i], values, totals };
+  persistSnapshotMirror(S.snapshots);
+}
+function sheetSelSet() {
+  return window.__sheetSel || (window.__sheetSel = new Set());
+}
+/** Merge selected Live Sheet rows into one: keep earliest, end state from latest (nets cancel). */
+async function mergeSelectedSheetRows() {
+  const sel = [...sheetSelSet()];
+  if (sel.length < 2) { toast('Select 2 or more rows to merge'); return; }
+  const rows = sel.map(id => S.snapshots.find(s => s.id === id)).filter(Boolean);
+  if (rows.length < 2) { toast('Selected rows not found'); return; }
+  rows.sort((a, b) => String(a.ts || '').localeCompare(String(b.ts || '')));
+  const keep = rows[0];
+  const last = rows[rows.length - 1];
+  const drop = rows.slice(1);
+  const patch = {
+    values: { ...(last.values || {}) },
+    names: { ...(keep.names || {}), ...(last.names || {}) },
+    totals: { ...(last.totals || {}) },
+    source: keep.source === 'open' ? 'open' : 'merge',
+    mergedFrom: drop.map(r => r.id),
+    mergedAt: new Date().toISOString()
+  };
+  await cloudSet('snapshots', keep.id, patch, 10000);
+  const ki = S.snapshots.findIndex(s => s.id === keep.id);
+  if (ki >= 0) S.snapshots[ki] = { ...S.snapshots[ki], ...patch };
+  for (const r of drop) {
+    await withTimeout(A.del('snapshots', r.id), 3000, 'del').catch(() => {});
+  }
+  const dropIds = new Set(drop.map(r => r.id));
+  S.snapshots = S.snapshots.filter(s => !dropIds.has(s.id));
+  persistSnapshotMirror(S.snapshots);
+  sheetSelSet().clear();
+  audit('sheet.merge', `merged ${rows.length} rows → ${keep.id}`);
+  toast(`Merged ${rows.length} rows into one`);
+  render(true);
 }
 async function tick() {
   if (!started) return;
@@ -2189,6 +2304,7 @@ async function migrate() {
       await mop(A.add('items', { name, group: 'metric', currency: cfg().base, balance: 0, prev: 0, opening: 0, include: true, archived: false, order: o++, updatedAt: new Date().toISOString(), source: 'manual', status: 'manual' }), 'migrate report metric');
     }
     await absorbCountFix();
+    await absorbBounceBack();
   } catch (e) {
     console.warn('hisab: migrate aborted', e);
     if (/timed out/i.test(e?.message || '')) window.__cloudDown = true;
@@ -2284,24 +2400,30 @@ function render(force) {
   const a = document.activeElement;
   if (!force && a && a.closest('main') && ['INPUT', 'SELECT', 'TEXTAREA'].includes(a.tagName)) { pendingRender = true; return; }
   pendingRender = false;
-  const errCount = visibleSyncErrors().length;
-  const link = ([k, l]) => `<a href="#/${k}" class="${k === page ? 'on' : ''}">${esc(l)}${k === 'errors' && errCount ? ` (${errCount})` : ''}</a>`;
-  $('#nav').innerHTML = '<div class="logo"><span>H</span>Hisab</div>' + NAV_GROUPS.map(([label, keys]) => `<div class="nav-sec"><div class="nav-label">${esc(label)}</div>${NAV.filter(([k]) => keys.includes(k)).map(link).join('')}</div>`).join('');
-  const open = window.__navGroup || '';
-  const openKeys = (NAV_GROUPS.find(([label]) => label === open) || [null, []])[1];
-  $('#navGroups').innerHTML = `<div class="ng-bar">${NAV_GROUPS.map(([label]) => `<button type="button" class="${open === label ? 'on' : ''}" data-click="navgroup" data-g="${esc(label)}">${label}</button>`).join('')}</div>${openKeys.length ? `<div class="ng-links">${NAV.filter(([k]) => openKeys.includes(k)).map(link).join('')}</div>` : ''}`;
-  $('#hdrStats').innerHTML = headerStats();
-  $('#pageTitle').textContent = (NAV.find(n => n[0] === page) || [])[1] || '';
-  const fn = VIEWS[page] || VIEWS.overview;
-  $('#main').innerHTML = fn();
-  if (page === 'overview') document.querySelectorAll('.chart-scroll').forEach(el => { el.scrollLeft = el.scrollWidth; });
-  if (page === 'sheet') {
-    const tw = document.querySelector('#main .tw');
-    if (tw) tw.scrollLeft = tw.scrollWidth;
+  try {
+    const errCount = visibleSyncErrors().length;
+    const link = ([k, l]) => `<a href="#/${k}" class="${k === page ? 'on' : ''}">${esc(l)}${k === 'errors' && errCount ? ` (${errCount})` : ''}</a>`;
+    $('#nav').innerHTML = '<div class="logo"><span>H</span>Hisab</div>' + NAV_GROUPS.map(([label, keys]) => `<div class="nav-sec"><div class="nav-label">${esc(label)}</div>${NAV.filter(([k]) => keys.includes(k)).map(link).join('')}</div>`).join('');
+    const open = window.__navGroup || '';
+    const openKeys = (NAV_GROUPS.find(([label]) => label === open) || [null, []])[1];
+    $('#navGroups').innerHTML = `<div class="ng-bar">${NAV_GROUPS.map(([label]) => `<button type="button" class="${open === label ? 'on' : ''}" data-click="navgroup" data-g="${esc(label)}">${label}</button>`).join('')}</div>${openKeys.length ? `<div class="ng-links">${NAV.filter(([k]) => openKeys.includes(k)).map(link).join('')}</div>` : ''}`;
+    $('#hdrStats').innerHTML = headerStats();
+    $('#pageTitle').textContent = (NAV.find(n => n[0] === page) || [])[1] || '';
+    const fn = VIEWS[page] || VIEWS.overview;
+    $('#main').innerHTML = fn();
+    if (page === 'overview') document.querySelectorAll('.chart-scroll').forEach(el => { el.scrollLeft = el.scrollWidth; });
+    if (page === 'sheet') {
+      const tw = document.querySelector('#main .tw');
+      if (tw) requestAnimationFrame(() => { tw.scrollLeft = tw.scrollWidth; });
+    }
+    const last = latestSnap();
+    $('#syncState').textContent = last ? 'Last row: ' + dt(last.ts) : 'No rows yet';
+    paintCalcProgress();
+  } catch (err) {
+    console.error('hisab render', err);
+    const msg = err && err.message ? err.message : String(err);
+    try { $('#main').innerHTML = `<div class="card err">Display failed: ${esc(msg)}</div>`; } catch { /* ignore */ }
   }
-  const last = latestSnap();
-  $('#syncState').textContent = last ? 'Last row: ' + dt(last.ts) : 'No rows yet';
-  paintCalcProgress();
 }
 function route() { page = (location.hash.replace('#/', '') || 'overview'); window.__navGroup = ''; tabGroup = null; render(true); }
 function headerStats() {
@@ -3306,6 +3428,24 @@ function fwdLiveHtml(st) {
     ? `${dt(lr.finished || lr.started)} · ${lr.fetched} orders (${esc(srcLabel)}) · ${lr.newIds} new${sentBits}${lr.error ? ` · <b class="neg">${esc(lr.error)}</b>` : ''}`
     : 'Never';
   const done = r => ['forwarded', 'exists'].includes(r.status);
+  const STAGE_META = {
+    PENDING: { label: 'Pending', tone: 'pending' },
+    SHIPPED: { label: 'Shipped', tone: 'ok' },
+    RTS: { label: 'RTS', tone: 'warn' }
+  };
+  const ecomCell = r => {
+    const cur = String(r.stage || r.ecom_status || 'PENDING').toUpperCase();
+    const sent = String(r.sent_stages || '');
+    const bits = ['PENDING', 'SHIPPED', 'RTS'].map(st => {
+      const m = STAGE_META[st];
+      const isCur = cur === st;
+      const isSent = sent.includes(',' + st + ',');
+      if (!isCur && !isSent) return `<span class="fwd-stage off" title="Not seen / not sent">${esc(m.label)}</span>`;
+      if (isSent) return `<span class="fwd-stage sent ${m.tone}" title="Sent as ${m.label}">✓ ${esc(m.label)}</span>`;
+      return `<span class="fwd-stage cur ${m.tone}" title="Current Ecom Drive status — not sent yet">${esc(m.label)}</span>`;
+    }).join('');
+    return `<td class="fwd-ecom">${bits}</td>`;
+  };
   const trackBtn = r => {
     const shipped = String(r.ecom_status || '').toUpperCase() === 'SHIPPED' || /steadfast|packzy/i.test(String(r.courier || ''));
     if (!shipped && !r.courier_status) return '';
@@ -3313,8 +3453,8 @@ function fwdLiveHtml(st) {
   };
   const rows = st.rows.map(r => `<tr>
       <td><b>${esc(r.invoice_id)}</b></td><td>${esc(r.phone)}</td><td>${esc(r.name)}</td><td>${esc(r.courier)}</td>
-      <td class="n">৳${Number(r.cod_amount || 0).toLocaleString('en-IN')}</td><td>${pill(r)}</td>
-      <td class="fwd-courier-status">${r.courier_status ? esc(r.courier_status) : '<span class="muted">—</span>'}${r.ecom_status ? `<small class="muted">${esc(r.ecom_status)}</small>` : ''}</td>
+      <td class="n">৳${Number(r.cod_amount || 0).toLocaleString('en-IN')}</td>${ecomCell(r)}<td>${pill(r)}</td>
+      <td class="fwd-courier-status">${r.courier_status ? esc(r.courier_status) : '<span class="muted">—</span>'}</td>
       <td class="n">${r.attempts}</td>
       <td>${r.last_attempt_at ? dt(r.last_attempt_at) : '<span class="muted">—</span>'}${r.next_retry_at && !done(r) ? `<small class="muted">retry ${dt(r.next_retry_at)}</small>` : ''}</td>
       <td class="fwd-row-btns">${r.attempts ? `<button class="btn sm" data-click="fwdLog" data-id="${esc(r.invoice_id)}">Request</button>` : `<button class="btn sm" data-click="fwdPreview" data-id="${esc(r.invoice_id)}">Preview</button>`}${trackBtn(r)}${['failed', 'no_match', 'invalid'].includes(r.status) ? `<button class="btn sm" data-click="fwdRetryOne" data-id="${esc(r.invoice_id)}">Retry</button>` : ''}</td>
@@ -3345,9 +3485,10 @@ function fwdLiveHtml(st) {
           <button class="btn sm" data-click="fwdRetry" data-which="failed" ${k.errors ? '' : 'disabled'}>Retry errors (${k.errors})</button>
         </div>
       </div>
-      <div class="tw"><table class="fwd-table"><tr><th>Invoice ID</th><th>Phone</th><th>Name</th><th>Courier</th><th class="n">COD</th><th>Status</th><th>Courier step</th><th class="n">Tries</th><th>Last attempt</th><th></th></tr>
-      ${rows || '<tr><td colspan="10" class="muted">No invoices yet. Press “Sync now”.</td></tr>'}
+      <div class="tw"><table class="fwd-table"><tr><th>Invoice ID</th><th>Phone</th><th>Name</th><th>Courier</th><th class="n">COD</th><th>Ecom</th><th>Status</th><th>Courier step</th><th class="n">Tries</th><th>Last attempt</th><th></th></tr>
+      ${rows || '<tr><td colspan="11" class="muted">No invoices yet. Press “Sync now”.</td></tr>'}
       </table></div>
+      <p class="muted fwd-stage-legend"><span class="fwd-stage sent ok">✓ Shipped</span> = সেই স্ট্যাটাসে পাঠানো হয়েছে · <span class="fwd-stage cur pending">Pending</span> = এখন Ecom-এ আছে, এখনো পাঠানো হয়নি · ধূসর = দেখা যায়নি</p>
     </div>`;
 }
 async function fwdPost(path, body) {
@@ -3425,6 +3566,13 @@ const VIEWS = {
       const visible = folded ? [g.rows[0]] : g.rows;
       visible.forEach((r, vi) => shown.push({ r, prev: visible[vi + 1] || groups[gi + 1]?.rows[0] || null, fold: g.rows.length > 1 && vi === 0 ? g : null, folded }));
     });
+    const sel = sheetSelSet();
+    const selN = [...sel].filter(id => rows.some(r => r.id === id)).length;
+    const PAGE_SIZE = 10;
+    const totalPages = Math.max(1, Math.ceil(shown.length / PAGE_SIZE) || 1);
+    let sheetPage = Math.min(Math.max(1, Number(window.__sheetPage) || 1), totalPages);
+    window.__sheetPage = sheetPage;
+    const pageRows = shown.slice((sheetPage - 1) * PAGE_SIZE, sheetPage * PAGE_SIZE);
     const rowHtml = s => {
       const r = s.r, prev = s.prev;
       const p = profitOf(r), pp = prev ? profitOf(prev) : p;
@@ -3434,15 +3582,26 @@ const VIEWS = {
         const prevV = prev ? snapCell(prev, i) : cur;
         return diffCell(cur, prevV, false, fmt);
       };
-      return `<tr><td><div class="sheet-time">${dt(r.ts)}${foldBtn}</div></td>${items.map(cell).join('')}${tot.map(([k]) => diffCell(r.totals?.[k], prev ? prev.totals?.[k] : r.totals?.[k], true)).join('')}${diffCell(p, pp, true, sgn)}<td><span class="pill">${esc(r.source)}</span></td><td class="why"><button type="button" class="why-btn" data-click="sheetWhy" data-id="${esc(r.id)}" data-prev="${esc(prev?.id || '')}" title="কী বেড়েছে, কোথায় গেছে">i</button></td></tr>`;
+      const picked = sel.has(r.id);
+      return `<tr class="${picked ? 'sheet-picked' : ''}"><td class="sheet-pick"><input type="checkbox" data-act="sheetPick" data-id="${esc(r.id)}" ${picked ? 'checked' : ''} title="Select row to merge"></td><td><div class="sheet-time">${dt(r.ts)}${foldBtn}</div></td>${items.map(cell).join('')}${tot.map(([k]) => diffCell(r.totals?.[k], prev ? prev.totals?.[k] : r.totals?.[k], true)).join('')}${diffCell(p, pp, true, sgn)}<td><span class="pill">${esc(r.source)}</span></td><td class="why"><button type="button" class="why-btn" data-click="sheetWhy" data-id="${esc(r.id)}" data-prev="${esc(prev?.id || '')}" title="কী বেড়েছে, কোথায় গেছে">i</button></td></tr>`;
     };
+    const pager = shown.length
+      ? `<div class="sheet-pager">
+          <button type="button" class="btn sm" data-click="sheetPage" data-dir="-1" ${sheetPage <= 1 ? 'disabled' : ''}>Prev</button>
+          <span class="muted">Page ${sheetPage} / ${totalPages} · showing ${pageRows.length} of ${shown.length}</span>
+          <button type="button" class="btn sm" data-click="sheetPage" data-dir="1" ${sheetPage >= totalPages ? 'disabled' : ''}>Next</button>
+        </div>`
+      : '';
     return `<div class="card form"><label>Date (Dhaka)<input type="date" data-act="sheetDate" value="${esc(f)}"></label>
       <button class="btn primary" data-click="calculateNow" ${window.__calcBusy ? 'disabled' : ''}>${esc(calcBtnLabel())}</button><button class="btn" data-click="csv">Export CSV</button>
+      <button class="btn" data-click="mergeSheet" ${selN < 2 || window.__sheetMerging ? 'disabled' : ''} title="Combine selected rows into one (opposing swings cancel)">${window.__sheetMerging ? 'Merging…' : (selN >= 2 ? `Merge (${selN})` : 'Merge')}</button>
       <button class="btn danger" data-click="clearSheet" ${window.__sheetClearing ? 'disabled' : ''} title="Delete all Live Sheet rows and start fresh">${window.__sheetClearing ? 'Clearing…' : 'Clear Live Sheet'}</button>
       <label style="flex-direction:row;align-items:center;color:inherit"><input type="checkbox" data-act="exfin" ${window.__exFin ? 'checked' : ''}> profit: leave out owner / loan money</label>
       ${window.__calcMsg ? `<p class="muted">${esc(window.__calcMsg)}</p>` : ''}${visibleSyncErrors().length ? `<p class="err">${visibleSyncErrors().length} check(s) failed. Open Errors for the list.</p>` : ''}</div>
-    <div class="tw"><table class="sheet"><tr><th>Time (BST)</th>${items.map(i => `<th class="n">${esc(ECOM_SALE.has(i.name) ? shortName(i.name) : uiName(i.name))}</th>`).join('')}${tot.map(([, l]) => `<th class="n">${l}</th>`).join('')}<th class="n">Profit (today)</th><th>Source</th><th class="why"></th></tr>
-    ${shown.map(rowHtml).join('') || '<tr><td colspan="99" class="muted">No rows yet.</td></tr>'}</table></div>`;
+    ${pager}
+    <div class="tw"><table class="sheet"><tr><th class="sheet-pick"></th><th>Time (BST)</th>${items.map(i => `<th class="n">${esc(ECOM_SALE.has(i.name) ? shortName(i.name) : uiName(i.name))}</th>`).join('')}${tot.map(([, l]) => `<th class="n">${l}</th>`).join('')}<th class="n">Profit (today)</th><th>Source</th><th class="why"></th></tr>
+    ${pageRows.map(rowHtml).join('') || '<tr><td colspan="99" class="muted">No rows yet.</td></tr>'}</table></div>
+    ${pager}`;
   },
 
   errors() {
@@ -3802,7 +3961,12 @@ document.addEventListener('change', async e => {
     else if (act === 'due') { await A.set('items', t.dataset.id, { dueDate: t.value }); audit('item.due', t.value); }
     else if (act === 'recon') { await A.set('ledger', t.dataset.id, { recon: t.value }); audit('ledger.recon', t.dataset.id + ' ' + t.value); }
     else if (act === 'exfin') { window.__exFin = t.checked; render(true); }
-    else if (act === 'sheetDate') { window.__sheetDate = t.value; render(true); }
+    else if (act === 'sheetPick') {
+      const set = sheetSelSet();
+      if (t.checked) set.add(t.dataset.id); else set.delete(t.dataset.id);
+      render(true);
+    }
+    else if (act === 'sheetDate') { window.__sheetDate = t.value; window.__sheetPage = 1; render(true); }
     else if (act === 'dd') { window.__dd = t.value; render(true); }
     else if (act === 'lq') { window.__lq = t.value; render(true); }
   } catch (err) { toast(err.message); }
@@ -3933,10 +4097,26 @@ document.addEventListener('click', async e => {
       if (open.has(id)) open.delete(id); else open.add(id);
       render(true);
     }
+    else if (a === 'sheetPage') {
+      const dir = Number(b.dataset.dir) || 0;
+      window.__sheetPage = Math.max(1, (Number(window.__sheetPage) || 1) + dir);
+      render(true);
+    }
     else if (a === 'csv') exportCsv();
     else if (a === 'hisabLogin') {
       const gate = await apiGate();
       demandHisabLogin(gate.setup, 'Calculate API-র জন্য Hisab ইমেইল/পাসওয়ার্ড দিয়ে ঢুকুন।');
+    }
+    else if (a === 'mergeSheet') {
+      if (window.__sheetMerging) return;
+      const n = sheetSelSet().size;
+      if (n < 2) return toast('Select 2 or more rows to merge');
+      if (!confirm(`Merge ${n} selected Live Sheet rows into one? Opposing swings cancel; other selected rows are removed.`)) return;
+      window.__sheetMerging = true;
+      render(true);
+      try { await mergeSelectedSheetRows(); }
+      catch (err) { toast(err.message || 'Merge failed'); }
+      finally { window.__sheetMerging = false; render(true); }
     }
     else if (a === 'clearSheet') {
       if (window.__sheetClearing) return;

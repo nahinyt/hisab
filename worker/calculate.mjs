@@ -9,13 +9,17 @@ import { checkAccounts, checkCourierHistory, checkDollar, checkExpenses, checkRe
 import { checkSteadfast } from './steadfast.mjs';
 import { checkPathao } from './pathao.mjs';
 import { withProgress, done as subDone, sub as subStart } from './progress.mjs';
-import { addDocRow, firestoreConfigured, getMainSettings, listDocs, setDocMerge } from './firestore.mjs';
+import { addDocRow, firestoreConfigured, getMainSettings, listDocs, listSnapshots, setDocMerge } from './firestore.mjs';
 
 const TZ = 'Asia/Dhaka';
 const USDT_DUE_ID = 'usdt-due';
 const ECOM_SALE = new Set(['Ecomdrive · Shipped', 'Ecomdrive · Pending', 'Ecomdrive · RTS', 'Ecomdrive · Pending Return']);
 const ECOM_FEE = new Set([]);
 const AWAITING = 'Steadfast · Awaiting approval';
+/** ৳1000 BDT in minor units (paisa = taka × 100). */
+const BOUNCE_TAKA = 1000;
+const BOUNCE_THRESHOLD_MINOR = BOUNCE_TAKA * 100;
+const BOUNCE_MATCH_TOL_MINOR = 100;
 
 const workerDir = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.HISAB_DATA_DIR || workerDir;
