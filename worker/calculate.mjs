@@ -584,7 +584,8 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
 
     await step('Dollar', async () => {
       const data = await checkDollar();
-      const base = Number(settings.dollarBase || '171');
+      // Left ($) = total deposited (dollarBase) − Meta Ads USD spent from EcomDrive.
+      const base = Number(settings.dollarBase || '0');
       const spent = Number(data.spent || 0);
       const left = Math.round((base - spent) * 100) / 100;
       const rate = String(data.rate || settings.rates?.USD || '128');

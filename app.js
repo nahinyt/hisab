@@ -1758,7 +1758,8 @@ async function applyDollar(manual) {
     const res = await api('/api/ecomdrive/dollar', { method: 'POST', timeoutMs: 60000 });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'Dollar check is not running. In the worker folder, run: node server.mjs');
-    const base = Number(cfg().dollarBase || '171');
+    // Simple model: Left ($) = Deposited (dollarBase) − Meta Ads spent (USD from EcomDrive).
+    const base = Number(cfg().dollarBase || '0');
     const spent = Number(data.spent || 0);
     const left = Math.round((base - spent) * 100) / 100;
     const rate = String(data.rate || cfg().rates?.USD || '128');
@@ -1790,14 +1791,14 @@ async function applyDollar(manual) {
       await cloudSet('items', it.id, { name: 'Dollar', prev, balance: m, currency: 'USD', opening: openM ?? it.opening, updatedAt: now, source: 'ecomdrive' }, 5000);
       changed = true;
     }
-    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    const days = (data.days || []).map(d => `${Number(d.date.slice(8))} ${months[Number(d.date.slice(5, 7)) - 1]} $${d.usd}`).join(', ');
-    window.__dollarMsg = `Left $${left.toFixed(2)} · main $${base.toFixed(2)} − ${data.category || 'Meta Ads'} $${Number(data.spent || 0).toFixed(2)}${days ? ` (${days})` : ''} · today $${Number(data.todayUsd || 0).toFixed(2)} · rate ${rate}`;
+    window.__dollarSpent = spent;
+    window.__dollarMsg = `বাকি $${left.toFixed(2)} = জমা $${base.toFixed(2)} − Meta Ads $${spent.toFixed(2)}` +
+      (Number(data.todayUsd) ? ` · আজ −$${Number(data.todayUsd).toFixed(2)}` : '');
     if (changed) {
       audit('account.dollar', window.__dollarMsg);
       try { await snapshot('dollar'); } catch (err) { window.__cloudErr = err.message || window.__cloudErr; }
     }
-    if (show) toast(window.__cloudErr ? 'Dollar ok · cloud slow/failed' : 'Dollar updated');
+    if (show) toast(window.__cloudErr ? 'Dollar ok · cloud slow/failed' : `Dollar left $${left.toFixed(2)}`);
   } catch (err) {
     window.__dollarErr = err.message;
     if (show) {
@@ -2153,7 +2154,7 @@ async function calculateNow(manual) {
 async function setBalance(id, str) {
   const it = S.items.find(i => i.id === id);
   if (!it) return;
-  // Editing the Dollar row sets MAIN dollar, then left = main − EcomDrive Meta Ads spend.
+  // Dollar row edit = set total deposited ($). Left becomes deposited − Meta Ads.
   if (it.externalId === 'dollar-main') {
     const dollars = Number(String(str || '').replace(/[,$\s]/g, ''));
     if (!Number.isFinite(dollars) || dollars < 0) { toast('Invalid dollar amount'); render(true); return; }
@@ -2162,20 +2163,22 @@ async function setBalance(id, str) {
     if (!main) { main = { id: 'main' }; S.settings.push(main); }
     main.dollarBase = dollarBase;
     main.dollarReady = true;
-    await cloudSet('settings', 'main', { dollarBase, dollarReady: true, dollarStart: cfg().dollarStart || '2026-10-25' }, 6000);
-    audit('settings.dollarBase', 'edit row → $' + dollarBase);
-    // Optimistic left until EcomDrive responds (keep row visible).
+    const dollarStart = cfg().dollarStart || todayStr();
+    main.dollarStart = dollarStart;
+    await cloudSet('settings', 'main', { dollarBase, dollarReady: true, dollarStart }, 6000);
+    audit('settings.dollarBase', 'set deposited $' + dollarBase);
     const openM = toMinor(dollarBase);
     const prev = it.balance || 0;
     const now = new Date().toISOString();
     it.prev = prev;
-    it.balance = openM != null ? openM : prev;
     it.opening = openM != null ? openM : it.opening;
     it.currency = 'USD';
     it.updatedAt = now;
     it.name = 'Dollar';
+    // Optimistic: show deposited until Meta Ads pull finishes (then left updates).
+    it.balance = openM != null ? openM : prev;
     await cloudSet('items', it.id, { name: 'Dollar', prev, balance: it.balance, opening: it.opening, currency: 'USD', updatedAt: now, externalId: 'dollar-main', group: 'cash' }, 6000);
-    toast('Main dollar set to $' + dollarBase);
+    toast('জমা সেট: $' + dollarBase + ' · এখন Meta Ads মাইনাস হবে');
     applyDollar(true).catch(() => {});
     render(true);
     return;
@@ -3866,22 +3869,31 @@ for (const [pg, groups] of Object.entries(PAGES)) {
       <p class="muted">Separate from EcomDrive. An SMS forwarder can POST bKash or Nagad balances to <code>${esc(smsUrl)}</code>. Send <code>{"account":"bkash","balance":"1500.00"}</code>, or the SMS itself as <code>{"text":"... Balance Tk 1500.00"}</code>. This computer must be running the Hisab server.</p>
       <button class="btn" data-click="checkSms" ${window.__smsManual ? 'disabled' : ''}>${window.__smsManual ? 'Checking…' : 'Check SMS balances'}</button>
       ${window.__smsMsg ? `<p class="muted">${esc(window.__smsMsg)}</p>` : ''}${window.__smsErr ? `<p class="err">${esc(window.__smsErr)}</p>` : ''}</div>` : '';
-    const dollarCard = pg === 'accounts' && g === 'cash' ? `<div class="card" id="dollarCard"><h3>Dollar (main − Meta Ads)</h3>
-      <p class="muted">Main dollar সেট করো, বা টেবিলে <b>Dollar</b> সারির Balance এডিট করো (ওটাই main)। Meta Ads খরচ মাইনাস: <code>left = main − spent</code>। রেট ${esc(cfg().rates?.USD || '128')}।</p>
+    const dollarCard = pg === 'accounts' && g === 'cash' ? (() => {
+      const deposited = Number(cfg().dollarBase || '0');
+      const dollarIt = S.items.find(i => !i.archived && i.externalId === 'dollar-main');
+      const left = dollarIt ? (dollarIt.balance || 0) / 100 : null;
+      const spent = window.__dollarSpent != null
+        ? Number(window.__dollarSpent)
+        : (Number.isFinite(left) ? Math.round((deposited - left) * 100) / 100 : null);
+      return `<div class="card" id="dollarCard"><h3>Dollar</h3>
+      <p class="muted">সিম্পল হিসাব: <b>বাকি = জমা − Meta Ads</b>। নতুন ডলার জমা দিলে নিচে Add করো। Calculate / Refresh এ Meta Ads খরচ মাইনাস হবে।</p>
+      <p><b>জমা: $${deposited.toFixed(2)}</b>
+        ${spent != null ? ` · <b>Meta Ads: $${Number(spent).toFixed(2)}</b>` : ''}
+        ${left != null ? ` · <b class="${left < 0 ? 'neg' : ''}">বাকি: $${left.toFixed(2)}</b>` : ' · বাকি: Refresh চাপো'}</p>
       <form class="form" data-form="dollarBase" style="margin-bottom:10px">
-        <label>Main dollar ($)<input name="base" value="${esc(cfg().dollarBase || '171.00')}" inputmode="decimal" required></label>
-        <button class="btn primary" name="mode" value="set" type="submit">Save main</button>
+        <input type="hidden" name="mode" value="add">
+        <label>Add dollar ($)<input name="add" placeholder="যেমন 50" inputmode="decimal" required></label>
+        <button class="btn primary" type="submit">Add</button>
       </form>
       <form class="form" data-form="dollarBase" style="margin-bottom:10px">
-        <label>Add to main ($)<input name="add" placeholder="e.g. 50" inputmode="decimal" required></label>
-        <button class="btn" name="mode" value="add" type="submit">Add dollar</button>
+        <input type="hidden" name="mode" value="set">
+        <label>জমার মোট সেট করো ($)<input name="base" value="${esc(String(deposited || ''))}" inputmode="decimal" required></label>
+        <button class="btn" type="submit">Set deposited</button>
       </form>
-      <button type="button" class="btn primary" data-click="checkDollar" ${window.__dollarBusy ? 'disabled' : ''}>${window.__dollarBusy ? 'Checking…' : 'Update from EcomDrive'}</button>
-      ${(() => {
-        const dollarIt = S.items.find(i => !i.archived && i.externalId === 'dollar-main');
-        return `<p><b>Main: $${esc(cfg().dollarBase || '171.00')}</b>${dollarIt ? ` · <b>Left: ${fmt(dollarIt.balance, 'USD')}</b>` : ' · Left: Update চাপো'}</p>`;
-      })()}
-      ${window.__dollarMsg ? `<p class="muted">${esc(window.__dollarMsg)}</p>` : ''}${window.__dollarErr ? `<p class="err">${esc(window.__dollarErr)}</p>` : ''}</div>` : '';
+      <button type="button" class="btn" data-click="checkDollar" ${window.__dollarBusy ? 'disabled' : ''}>${window.__dollarBusy ? 'Updating…' : 'Refresh (Meta Ads মাইনাস)'}</button>
+      ${window.__dollarMsg ? `<p class="muted">${esc(window.__dollarMsg)}</p>` : ''}${window.__dollarErr ? `<p class="err">${esc(window.__dollarErr)}</p>` : ''}</div>`;
+    })() : '';
     const addForm = `<div class="card" style="margin-top:14px"><h3>Add to ${GROUPS[g].label}</h3><form class="form" data-form="newitem"><input type="hidden" name="group" value="${g}"><label>Name<input name="name" required></label><label>Currency<input name="currency" value="${esc(cfg().base)}" size="6"></label><label>Category<input name="category"></label><button class="btn primary" type="submit">Add</button></form></div>`;
     if (pg === 'courier') {
       const steadfast = list.filter(i => courierSide(i) === 'steadfast');
@@ -3904,7 +3916,7 @@ for (const [pg, groups] of Object.entries(PAGES)) {
     }
     return `${groups.length > 1 ? `<div class="tabs">${groups.map(x => `<button class="${x === g ? 'on' : ''}" data-click="tab" data-g="${x}">${GROUPS[x].label}</button>`).join('')}</div>` : ''}
     ${stockBtn}${reportBtn}${supBtn}${acctBtn}
-    <div class="card"><b>${GROUPS[g].label} total: ${fmt(gt)}</b> <span class="muted">· edit a balance and press Enter / click away. Dollar row = main $.</span></div>
+    <div class="card"><b>${GROUPS[g].label} total: ${fmt(gt)}</b> <span class="muted">· edit a balance and press Enter / click away. Dollar সারি = জমার মোট ($); টেবিলে দেখায় বাকি (জমা − Meta Ads)।</span></div>
     ${tableOf(list)}
     ${dollarCard}
     ${addForm}`;
@@ -4174,23 +4186,26 @@ document.addEventListener('submit', async e => {
       const mode = (v('mode') || f.querySelector('[name=mode]')?.value || 'set');
       const cur = Number(cfg().dollarBase || '0');
       let next;
+      let added = 0;
       if (mode === 'add') {
-        const add = Number(String(v('add') || '').replace(/[,$\s]/g, ''));
-        if (!Number.isFinite(add) || add === 0) throw new Error('Enter a dollar amount to add');
-        next = Math.round((cur + add) * 100) / 100;
+        added = Number(String(v('add') || '').replace(/[,$\s]/g, ''));
+        if (!Number.isFinite(added) || added === 0) throw new Error('কত ডলার অ্যাড করবে লিখো (যেমন 50)');
+        next = Math.round((cur + added) * 100) / 100;
       } else {
         const base = Number(String(v('base') || '').replace(/[,$\s]/g, ''));
-        if (!Number.isFinite(base) || base < 0) throw new Error('Enter a valid main dollar amount');
+        if (!Number.isFinite(base) || base < 0) throw new Error('জমার মোট ডলার লিখো');
         next = Math.round(base * 100) / 100;
       }
       const dollarBase = next.toFixed(2);
+      const dollarStart = cfg().dollarStart || todayStr();
       let main = S.settings.find(x => x.id === 'main');
       if (!main) { main = { id: 'main' }; S.settings.push(main); }
       main.dollarBase = dollarBase;
       main.dollarReady = true;
-      await cloudSet('settings', 'main', { dollarBase, dollarReady: true, dollarStart: cfg().dollarStart || '2026-10-25' }, 6000);
-      audit('settings.dollarBase', mode === 'add' ? `add → $${dollarBase}` : `set $${dollarBase}`);
-      toast(mode === 'add' ? `Main dollar is now $${dollarBase}` : `Main dollar saved: $${dollarBase}`);
+      main.dollarStart = dollarStart;
+      await cloudSet('settings', 'main', { dollarBase, dollarReady: true, dollarStart }, 6000);
+      audit('settings.dollarBase', mode === 'add' ? `add $${added} → deposited $${dollarBase}` : `set deposited $${dollarBase}`);
+      toast(mode === 'add' ? `+$${added} জমা · মোট জমা $${dollarBase}` : `জমা সেট $${dollarBase}`);
       await applyDollar(true);
     } else if (kind === 'rates') {
       const rates = { ...(c.rates || {}) };
