@@ -2213,7 +2213,7 @@ async function setBalance(id, str) {
       archived: false, order: it.order ?? 0, updatedAt: now, source: 'manual', status: 'manual', externalId: ''
     }, 6000);
     audit('balance.edit', `USDT DUE: ${fmt(prev, it.currency)} → ${fmt(m, it.currency)}`);
-    scheduleSnap();
+  scheduleSnap();
     toast('USDT DUE saved' + (window.__cloudDown || window.__cloudErr ? ' on this device' : ''));
     render(true);
     return;
@@ -2301,9 +2301,9 @@ async function migrate() {
         }
       }), 'migrate types');
     }
-    let o = S.items.length;
+  let o = S.items.length;
     for (const name of REPORT_METRICS) {
-      if (S.items.some(i => i.group === 'metric' && i.name === name)) continue;
+    if (S.items.some(i => i.group === 'metric' && i.name === name)) continue;
       await mop(A.add('items', { name, group: 'metric', currency: cfg().base, balance: 0, prev: 0, opening: 0, include: true, archived: false, order: o++, updatedAt: new Date().toISOString(), source: 'manual', status: 'manual' }), 'migrate report metric');
     }
     await absorbCountFix();
@@ -2411,16 +2411,15 @@ function render(force) {
     const openKeys = (NAV_GROUPS.find(([label]) => label === open) || [null, []])[1];
     $('#navGroups').innerHTML = `<div class="ng-bar">${NAV_GROUPS.map(([label]) => `<button type="button" class="${open === label ? 'on' : ''}" data-click="navgroup" data-g="${esc(label)}">${label}</button>`).join('')}</div>${openKeys.length ? `<div class="ng-links">${NAV.filter(([k]) => openKeys.includes(k)).map(link).join('')}</div>` : ''}`;
     $('#hdrStats').innerHTML = headerStats();
-    $('#pageTitle').textContent = (NAV.find(n => n[0] === page) || [])[1] || '';
-    const fn = VIEWS[page] || VIEWS.overview;
-    $('#main').innerHTML = fn();
-    if (page === 'overview') document.querySelectorAll('.chart-scroll').forEach(el => { el.scrollLeft = el.scrollWidth; });
+  $('#pageTitle').textContent = (NAV.find(n => n[0] === page) || [])[1] || '';
+  const fn = VIEWS[page] || VIEWS.overview;
+  $('#main').innerHTML = fn();
     if (page === 'sheet') {
       const tw = document.querySelector('#main .tw');
       if (tw) requestAnimationFrame(() => { tw.scrollLeft = tw.scrollWidth; });
     }
-    const last = latestSnap();
-    $('#syncState').textContent = last ? 'Last row: ' + dt(last.ts) : 'No rows yet';
+  const last = latestSnap();
+  $('#syncState').textContent = last ? 'Last row: ' + dt(last.ts) : 'No rows yet';
     paintCalcProgress();
   } catch (err) {
     console.error('hisab render', err);
@@ -2481,7 +2480,7 @@ function finUpTo(date, iso) { // money kept out of today's profit: Add +, Withdr
 function todayChange() {
   const date = todayStr(), t = compute(), b = dayBounds(date), open = b.opening?.totals || null;
   const nowIso = new Date().toISOString(), pts = [];
-    if (open) {
+  if (open) {
     pts.push({ m: 0, v: 0, time: '12:00 AM', day: 'শুরু' });
     for (const s of sortedSnaps().filter(s => s.date === date)) pts.push({ m: minsOfDay(s.ts), v: s.totals.nw - open.nw - finUpTo(date, s.ts) + expenseOf(s), ts: s.ts });
     const todayLabel = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, day: 'numeric', month: 'short' }).format(new Date());
@@ -2504,138 +2503,208 @@ function profitCalc() {
   for (const s of sortedSnaps()) { if (s.date !== cd) { open[s.date] = prev !== null ? prev : s.totals.nw; cd = s.date; } prev = s.totals.nw; }
   return s => s.totals.nw - open[s.date] - finUpTo(s.date, s.ts) + expenseOf(s);
 }
+/** Closing totals per Dhaka day — light overview (Mobbin net-worth style). */
+function overviewDayRows(limit = 30) {
+  const days = dailyChanges(limit);
+  const lastByDate = {};
+  for (const s of sortedSnaps()) lastByDate[s.date] = s;
+  return days.map(d => {
+    const s = lastByDate[d.date];
+    const t = s?.totals || {};
+    return {
+      date: d.date,
+      profit: d.change,
+      nw: d.close,
+      assets: d.assets,
+      cash: t.cash ?? 0,
+      courier: t.courier ?? 0,
+      stock: t.stock ?? 0,
+      supplier: t.supplier ?? 0
+    };
+  });
+}
+function overviewRangeKey() {
+  if (window.__ovRange) return window.__ovRange;
+  try {
+    const saved = localStorage.getItem('hisab_ov_range');
+    if (['1W', '1M', '3M', 'ALL'].includes(saved)) {
+      window.__ovRange = saved;
+      return saved;
+    }
+  } catch { /* ignore */ }
+  return '1M';
+}
+function overviewRangeLimit() {
+  const r = overviewRangeKey();
+  if (r === '1W') return 7;
+  if (r === '3M') return 90;
+  if (r === 'ALL') return 400;
+  return 30;
+}
+/** Compact money label for chart end-caps (paisa → ৳). */
 function fmtChart(m) {
   if (m == null) return '—';
   const neg = m < 0, a = Math.abs(m) / 100;
   let s;
-  if (a >= 100000) s = (a / 100000).toFixed(a >= 1000000 ? 1 : 2) + ' লাখ';
+  if (a >= 100000) s = (a / 100000).toFixed(a >= 1000000 ? 1 : 2) + 'L';
   else if (a >= 1000) s = Math.round(a).toLocaleString('en-IN');
   else if (Math.abs(a - Math.round(a)) < 0.005) s = String(Math.round(a));
   else s = a.toFixed(2);
-  return (neg ? '-' : '') + s;
+  return (neg ? '−' : '') + s;
 }
-function chartWhen(p) {
-  if (p.time) return { time: p.time, day: p.day || '' };
-  const d = new Date(p.ts);
-  const time = new Intl.DateTimeFormat('en-US', { timeZone: TZ, hour: 'numeric', minute: '2-digit', hour12: true }).format(d);
-  const day = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, day: 'numeric', month: 'short' }).format(d);
-  return { time, day };
+/** Two optional series only: net worth + daily profit (persisted). */
+function overviewSeriesState() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('hisab_ov_series') || 'null');
+    if (raw && typeof raw === 'object') {
+      return { nw: raw.nw !== false, profit: raw.profit !== false };
+    }
+  } catch { /* ignore */ }
+  return { nw: true, profit: true };
 }
-function labeledChart(points, aria) {
-  if (!points || points.length < 2) return '<p class="muted">দুইবারের হিসাব হলে এই গ্রাফ আসবে।</p>';
-  const col = 84, bot = 38, plotT = 30, plotB = 10, H = 220;
-  const W = 8 + points.length * col + 8;
-  const vals = points.map(p => p.v);
+function saveOverviewSeries(state) {
+  try { localStorage.setItem('hisab_ov_series', JSON.stringify(state)); } catch { /* ignore */ }
+}
+function overviewChartGeom(rows, { height = 168, bot = 10, withLabels = false } = {}) {
+  const labelBot = withLabels ? 22 : 0;
+  const col = Math.max(16, Math.min(40, Math.floor(680 / rows.length)));
+  const plotT = 10, plotB = 4;
+  const H = height + labelBot;
+  const W = 8 + rows.length * col + 8;
+  const X = i => 8 + i * col + col / 2;
+  const labelEvery = rows.length > 45 ? 10 : rows.length > 20 ? 5 : 3;
+  const xLabels = withLabels ? rows.map((r, i) => {
+    if (i % labelEvery && i !== rows.length - 1 && i !== 0) return '';
+    const d = new Date(r.date + 'T12:00:00+06:00');
+    const day = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, day: 'numeric', month: 'short' }).format(d);
+    return `<text x="${X(i)}" y="${H - 6}" text-anchor="middle" font-size="10" fill="#94a3b8">${esc(day)}</text>`;
+  }).join('') : '';
+  return { col, plotT, plotB, bot, H, W, X, xLabels, labelBot, height };
+}
+function overviewNwSvg(rows, geom) {
+  const { plotT, plotB, bot, H, W, X, xLabels, height } = geom;
+  const vals = rows.map(r => Number(r.nw) || 0);
   let mn = Math.min(...vals), mx = Math.max(...vals);
   if (mn === mx) { mn -= 100; mx += 100; }
-  const pad = (mx - mn) * 0.12 || 100;
+  const pad = (mx - mn) * 0.1 || 100;
   mn -= pad; mx += pad;
-  const Y = v => plotT + (mx - v) / (mx - mn) * (H - bot - plotT - plotB);
-  const X = i => 8 + i * col + col / 2;
-  const poly = points.map((p, i) => `${X(i)},${Y(p.v)}`).join(' ');
-  const zero = mn < 0 && mx > 0 ? `<line x1="4" x2="${W - 4}" y1="${Y(0)}" y2="${Y(0)}" stroke="#cbd5e1" stroke-dasharray="3 3"/>` : '';
-  const cols = points.map((p, i) => {
-    const prev = i ? points[i - 1].v : p.v;
-    const fill = p.v > prev ? '#15803d' : p.v < prev ? '#b91c1c' : '#1c2430';
-    const when = chartWhen(p);
-    const last = i === points.length - 1;
-    return `<text x="${X(i)}" y="15" text-anchor="middle" font-size="11" font-weight="700" fill="${fill}">${esc(fmtChart(p.v))}</text>
-      <circle cx="${X(i)}" cy="${Y(p.v)}" r="${last ? 5 : 3.5}" fill="${last ? '#0f766e' : fill}"/>
-      <text x="${X(i)}" y="${H - 22}" text-anchor="middle" font-size="11" font-weight="600" fill="#1c2430">${esc(when.time)}</text>
-      <text x="${X(i)}" y="${H - 8}" text-anchor="middle" font-size="10" fill="#6b7686">${esc(when.day)}</text>`;
+  const Y = v => plotT + (mx - v) / (mx - mn) * (height - bot - plotT - plotB);
+  const line = rows.map((r, i) => `${X(i)},${Y(Number(r.nw) || 0)}`).join(' ');
+  const area = `${X(0)},${height - bot} ${line} ${X(rows.length - 1)},${height - bot}`;
+  const lastI = rows.length - 1;
+  const lastV = Number(rows[lastI].nw) || 0;
+  return `<svg class="ov-svg" viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none" role="img" aria-label="Net worth">
+    <defs><linearGradient id="ovNwFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#0f766e" stop-opacity=".22"/><stop offset="100%" stop-color="#0f766e" stop-opacity="0"/></linearGradient></defs>
+    <polygon fill="url(#ovNwFill)" points="${area}"/>
+    <polyline fill="none" stroke="#0f766e" stroke-width="2.25" points="${line}" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="${X(lastI)}" cy="${Y(lastV)}" r="4.5" fill="#0f766e"/>
+    <text x="${W - 6}" y="${Math.max(14, Y(lastV) - 8)}" text-anchor="end" font-size="11" font-weight="700" fill="#0f766e">${esc(fmtChart(lastV))}</text>
+    ${xLabels}
+  </svg>`;
+}
+function overviewProfitSvg(rows, geom) {
+  const { plotT, plotB, bot, H, W, X, xLabels, height, col } = geom;
+  const vals = rows.map(r => Number(r.profit) || 0);
+  let mx = Math.max(...vals.map(Math.abs), 1);
+  const pad = mx * 0.12 || 100;
+  mx += pad;
+  const zero = plotT + (mx - 0) / (mx - (-mx)) * (height - bot - plotT - plotB);
+  const Y = v => plotT + (mx - v) / (mx - (-mx)) * (height - bot - plotT - plotB);
+  const barW = Math.max(3, Math.min(14, col * 0.45));
+  const bars = rows.map((r, i) => {
+    const v = Number(r.profit) || 0;
+    const y = Y(v), y0 = zero;
+    const top = Math.min(y, y0), h = Math.max(1.5, Math.abs(y - y0));
+    const fill = v >= 0 ? '#0f766e' : '#c2413a';
+    return `<rect x="${X(i) - barW / 2}" y="${top}" width="${barW}" height="${h}" rx="1.5" fill="${fill}" opacity=".88"/>`;
   }).join('');
-  return `<div class="chart-scroll"><svg class="chart" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img" aria-label="${esc(aria || 'chart')}">${zero}<polyline fill="none" stroke="#0f766e" stroke-width="2" points="${poly}" stroke-linejoin="round"/>${cols}</svg></div>`;
+  const lastI = rows.length - 1;
+  const lastV = Number(rows[lastI].profit) || 0;
+  return `<svg class="ov-svg" viewBox="0 0 ${W} ${H}" width="100%" height="${H}" preserveAspectRatio="none" role="img" aria-label="Daily profit">
+    <line x1="8" y1="${zero}" x2="${W - 8}" y2="${zero}" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="4 3"/>
+    ${bars}
+    <text x="${W - 6}" y="${Math.max(14, Y(lastV) - 8)}" text-anchor="end" font-size="11" font-weight="700" fill="${lastV >= 0 ? '#0f766e' : '#c2413a'}">${esc(sgn(lastV))}</text>
+    ${xLabels}
+  </svg>`;
 }
-function pointsForTotal(key) {
-  return sortedSnaps().map(s => ({ ts: s.ts, v: s.totals?.[key] ?? 0 }));
-}
-function pointsForName(name, abs) {
-  const out = [];
-  for (const s of sortedSnaps()) {
-    let v = null;
-    for (const [id, n] of Object.entries(s.names || {})) {
-      if (n === name) { v = s.values?.[id]; break; }
-    }
-    if (v == null) continue;
-    v = saleSheetValue(s, name, v);
-    out.push({ ts: s.ts, v: abs ? Math.abs(v) : v });
+/** Net worth + daily profit in one card — stacked panels, shared X, independent Y. */
+function overviewNwChart(rows, series = overviewSeriesState()) {
+  if (!rows || rows.length < 2) return '<p class="muted ov-empty">দুই দিনের হিসাব হলে গ্রাফ আসবে।</p>';
+  const showNw = !!series.nw, showProfit = !!series.profit;
+  if (!showNw && !showProfit) {
+    return '<p class="muted ov-empty">উপরে সিরিজ চালু করুন — নেট ওয়ার্থ বা দৈনিক লাভ।</p>';
   }
-  return out;
+  const both = showNw && showProfit;
+  const panels = [];
+  if (showNw) {
+    const geom = overviewChartGeom(rows, { height: both ? 150 : 188, bot: 8, withLabels: !showProfit });
+    panels.push(`<div class="ov-panel"><div class="ov-panel-lab nw">নেট ওয়ার্থ</div>${overviewNwSvg(rows, geom)}</div>`);
+  }
+  if (showProfit) {
+    const geom = overviewChartGeom(rows, { height: both ? 110 : 188, bot: 8, withLabels: true });
+    panels.push(`<div class="ov-panel"><div class="ov-panel-lab profit">দৈনিক লাভ</div>${overviewProfitSvg(rows, geom)}</div>`);
+  }
+  return `<div class="ov-chart${both ? ' twin' : ''}">${panels.join('')}</div>`;
 }
-function chartCard(title, hint, pts) {
-  if (!pts || pts.length < 2) return '';
-  const first = pts[0].v, last = pts[pts.length - 1].v, d = last - first;
-  return `<div class="card"><h3>${esc(title)} <b class="${d > 0 ? 'pos' : d < 0 ? 'neg' : ''}">${fmt(last)}</b></h3>
-    <p class="muted">${hint ? esc(hint) + ' · ' : ''}শুরু ${fmt(first)} · এই গ্রাফে ${sgn(d)} · উপরে অঙ্ক, নিচে সময়</p>
-    ${labeledChart(pts, title)}</div>`;
-}
-function historyCharts() {
-  const named = [
-    ['ইকমড্রাইভ', [
-      ['Ecomdrive · Shipped', 'Shipped', 'শিটের অঙ্ক, আগে ডেলিভারি বাদ, তারপর ১% COD'],
-      ['Ecomdrive · Pending', 'Pending', 'শিটের অঙ্ক, আগে ডেলিভারি বাদ, তারপর ১% COD'],
-      ['Ecomdrive · RTS', 'RTS', 'শিটের অঙ্ক, আগে ডেলিভারি বাদ, তারপর ১% COD'],
-      ['Ecomdrive · Pending Return', 'Pending Return', 'শিটের অঙ্ক, আগে ডেলিভারি বাদ, তারপর ১% COD']
-    ]],
-    ['Steadfast', [
-      ['Steadfast · Awaiting approval', 'In review', 'শিটের অঙ্ক, ১% COD কাটা'],
-      ['Steadfast · Balance', 'ব্যালেন্স', 'Steadfast যে টাকা জমা করেছে'],
-      ['Steadfast · Approval pending COD delivery charge', 'Approval charge', 'approval পাতার Charge, শিট থেকে কাটা']
-    ]],
-    ['Pathao', [
-      ['Pathao · Upcoming payment', 'Balance', ''],
-      ['Pathao · In review', 'In review', ''],
-      ['Pathao · Last processing', 'Last processing', ''],
-      ['Pathao · Last paid', 'Last paid', '']
-    ]],
-    ['খরচ', [
-      ['Meta Ads', 'Meta Ads', 'আজকের মেটা অ্যাডস। Count চালু থাকলে লাভের সাথে যোগ'],
-      ['Expenses except Meta Ads', 'Meta বাদে খরচ', 'আজকের বাকি খরচ। Count চালু থাকলে লাভের সাথে যোগ']
-    ]]
+function overviewPage() {
+  const { t } = kpiData();
+  const tc = todayChange();
+  const range = overviewRangeKey();
+  const series = overviewSeriesState();
+  const rows = overviewDayRows(overviewRangeLimit());
+  const first = rows[0], last = rows[rows.length - 1];
+  const span = first && last ? (Number(last.nw) || 0) - (Number(first.nw) || 0) : null;
+  const todayP = tc.now;
+  const ranges = [['1W', '1W'], ['1M', '1M'], ['3M', '3M'], ['ALL', 'সব']];
+  const parts = [
+    { k: 'cash', label: 'ক্যাশ', v: t.cash },
+    { k: 'courier', label: 'কুরিয়ার', v: t.courier },
+    { k: 'stock', label: 'স্টক', v: t.stock },
+    { k: 'supplier', label: 'সাপ্লায়ার বাকি', v: t.liab, neg: true },
+    { k: 'nw', label: 'নেট ওয়ার্থ', v: t.nw, tot: true }
   ];
-  const used = new Set(named.flatMap(([, rows]) => rows.map(r => r[0])));
-  const groups = named.map(([title, rows]) => [title, rows.map(([name, label, hint]) => chartCard(label, hint, pointsForName(name, name.endsWith('delivery') || name.endsWith('delivery charge'))))]);
-  const cash = [], dues = [];
-  for (const s of sortedSnaps()) {
-    for (const name of Object.values(s.names || {})) {
-      if (used.has(name) || name === 'Owner Adjustment' || ECOM_FEE.has(name)) continue;
-      used.add(name);
-      const item = S.items.find(i => i.name === name);
-      const card = chartCard(shortName(name), item?.group === 'supplier' ? 'বাকি, নেট ওয়ার্থ থেকে কাটা' : '', pointsForName(name, false));
-      if (item?.group === 'supplier') dues.push(card);
-      else cash.push(card);
-    }
-  }
-  const profitOf = profitCalc();
-  const profitPts = sortedSnaps().map(s => ({ ts: s.ts, v: profitOf(s) }));
-  const head = [
-    chartCard('নেট ওয়ার্থ', 'ক্যাশ + কুরিয়ার + স্টক − সাপ্লায়ার + ইকমড্রাইভ বিক্রি − ডেলিভারি', pointsForTotal('nw')),
-    chartCard('আজকের লাভ', 'প্রতিদিন রাত ১২টায় আবার ০ থেকে শুরু', profitPts),
-    chartCard('ক্যাশ', 'ব্যাংক, বিকাশ, নগদ, ডলার মিলিয়ে', pointsForTotal('cash')),
-    chartCard('কুরিয়ার পাওনা', 'Steadfast আর Pathao, শিটে যা গোনা হয়', pointsForTotal('courier')),
-    chartCard('স্টক', '', pointsForTotal('stock')),
-    chartCard('সাপ্লায়ার বাকি', 'নেট ওয়ার্থ থেকে কাটা হয়', pointsForTotal('supplier'))
-  ].join('');
-  const body = groups.map(([title, cards]) => {
-    const html = cards.filter(Boolean).join('');
-    return html ? `<h2 class="chart-h">${esc(title)}</h2>${html}` : '';
-  }).join('');
-  const rest = (cash.filter(Boolean).length || dues.filter(Boolean).length)
-    ? `<h2 class="chart-h">ক্যাশ, ডলার আর বাকি</h2>${cash.filter(Boolean).join('')}${dues.filter(Boolean).join('')}` : '';
-  return `<h2 class="chart-h">মোট</h2>${head}${body}${rest}`;
-}
-function dailyPanel() {
-  const tc = todayChange(), rows = dailyChanges(30), n = tc.now;
-  return `<div class="card"><div class="form" style="justify-content:space-between;align-items:center"><h3 style="margin:0">আজকের লাভ/ক্ষতি · Today's change</h3>
-    <label style="flex-direction:row;align-items:center;color:inherit"><input type="checkbox" data-act="exfin" ${window.__exFin ? 'checked' : ''}> leave out owner / loan money</label></div>
-    <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:baseline;margin:8px 0">
-      <div class="v ${n == null ? '' : n > 0 ? 'pos' : n < 0 ? 'neg' : ''}" style="font-size:28px;font-weight:700">${n == null ? 'Incomplete' : sgn(n)}</div>
-      <div class="muted">${tc.open ? `Started at ${fmt(tc.open.nw)} net worth (12 AM) → now ${fmt(tc.t.nw)}` : 'No opening snapshot yet'}<br>Total assets now ${fmt(tc.t.assets)}${tc.open ? ' (opening ' + fmt(tc.open.assets) + ')' : ''} · dues ${fmt(tc.t.liab)}</div></div>
-    ${labeledChart(tc.pts, 'আজকের লাভ')}
-    <p class="muted">প্রতিটি ঘরে উপরে অঙ্ক, নিচে সময়। সবুজ বেড়েছে, লাল কমেছে। রাত ১২টায় ০ থেকে শুরু। ব্যাংক থেকে সাপ্লায়ার দিলে এই লাইন নড়ে না, কারণ ক্যাশ আর বাকি দুটোই কমে। Add বা Withdraw আজকের এই লাইন থেকে বাদ। Expenses-এ Count চালু থাকলে আজকের সেই খরচ এই লাইনে যোগ হয়। রাত ১২টার পর আবার ০।${tc.open && !tc.complete ? ' আগের দিনের সারি নেই, তাই আজকের প্রথম সারি থেকে শুরু।' : ''}</p></div>
-  <div class="card"><h3>প্রতিদিনের ফলাফল</h3>${labeledChart(rows.map(r => { const d = new Date(r.date + 'T12:00:00+06:00'); const time = new Intl.DateTimeFormat('en-GB', { timeZone: TZ, day: 'numeric', month: 'short' }).format(d); return { v: r.change, time, day: r.complete ? 'পুরো দিন' : 'খোলা' }; }), 'প্রতিদিনের ফলাফল')}
-    <div class="tw" style="margin-top:10px;max-height:320px"><table><tr><th>Date</th><th class="n">Opening net worth</th><th class="n">Closing net worth</th><th class="n">Change</th><th class="n">Total assets at close</th><th></th></tr>
-    ${[...rows].reverse().map(r => `<tr><td>${r.date}</td><td class="n">${fmt(r.open)}</td><td class="n">${fmt(r.close)}</td><td class="n ${r.change > 0 ? 'pos' : r.change < 0 ? 'neg' : ''}">${sgn(r.change)}</td><td class="n">${fmt(r.assets)}</td><td>${r.complete ? '' : '<span class="pill warn">incomplete opening</span>'}</td></tr>`).join('') || '<tr><td colspan="6" class="muted">No rows yet.</td></tr>'}</table></div></div>`;
+  const recent = [...dailyChanges(14)].reverse();
+  return `${t.warn.map(w => `<div class="card err">${esc(w)}</div>`).join('')}
+  <div class="ov">
+    <section class="card ov-hero">
+      <div class="ov-kicker">নেট ওয়ার্থ</div>
+      <div class="ov-big">${fmt(t.nw)}</div>
+      <div class="ov-sub ${span == null ? '' : span > 0 ? 'pos' : span < 0 ? 'neg' : ''}">${span == null ? '—' : sgn(span)} · এই সময়কালে</div>
+      <div class="ov-tools">
+        <div class="ov-series" role="group" aria-label="Chart series">
+          <button type="button" class="ov-tog ${series.nw ? 'on' : ''}" data-click="ovSeries" data-s="nw" aria-pressed="${series.nw ? 'true' : 'false'}"><span class="ov-dot nw"></span>নেট ওয়ার্থ</button>
+          <button type="button" class="ov-tog ${series.profit ? 'on' : ''}" data-click="ovSeries" data-s="profit" aria-pressed="${series.profit ? 'true' : 'false'}"><span class="ov-dot profit"></span>দৈনিক লাভ</button>
+        </div>
+        <div class="ov-ranges" role="group" aria-label="Time range">${ranges.map(([id, lab]) =>
+          `<button type="button" class="ov-range ${range === id ? 'on' : ''}" data-click="ovRange" data-r="${esc(id)}" aria-pressed="${range === id ? 'true' : 'false'}">${esc(lab)}</button>`
+        ).join('')}</div>
+      </div>
+      ${overviewNwChart(rows, series)}
+    </section>
+    <div class="ov-split">
+      <section class="card ov-today">
+        <div class="ov-head">
+          <div class="ov-kicker">আজকের লাভ</div>
+          <label class="ov-exfin"><input type="checkbox" data-act="exfin" ${window.__exFin ? 'checked' : ''}> owner/loan বাদ</label>
+        </div>
+        <div class="ov-big ${todayP == null ? '' : todayP > 0 ? 'pos' : todayP < 0 ? 'neg' : ''}">${todayP == null ? '—' : sgn(todayP)}</div>
+        <p class="muted ov-note">${tc.open ? `রাত ১২টা খোলা ${fmt(tc.open.nw)} → এখন ${fmt(tc.t.nw)}` : 'আজকের খোলা সারি নেই'}</p>
+      </section>
+      <section class="card ov-break">
+        <div class="ov-kicker">ভাঙন</div>
+        <ul class="ov-parts">${parts.map(p =>
+          `<li class="${p.tot ? 'tot' : ''}" data-click="kpi" data-k="${esc(p.k)}"><span>${esc(p.label)}</span><b class="${p.neg ? 'neg' : ''}">${p.neg ? '− ' : ''}${fmt(p.v)}</b></li>`
+        ).join('')}</ul>
+      </section>
+    </div>
+    <section class="card ov-days">
+      <div class="ov-kicker">সাম্প্রতিক দিন</div>
+      <div class="tw ov-tw"><table><tr><th>তারিখ</th><th class="n">খোলা</th><th class="n">শেষ</th><th class="n">লাভ/ক্ষতি</th><th class="n">অ্যাসেট</th></tr>
+      ${recent.map(r => `<tr><td>${esc(r.date)}</td><td class="n">${fmt(r.open)}</td><td class="n">${fmt(r.close)}</td><td class="n ${r.change > 0 ? 'pos' : r.change < 0 ? 'neg' : ''}">${sgn(r.change)}</td><td class="n">${fmt(r.assets)}</td></tr>`).join('')
+        || '<tr><td colspan="5" class="muted">এখনো নেই</td></tr>'}
+      </table></div>
+    </section>
+  </div>`;
 }
 
 function kpiData() {
@@ -3523,18 +3592,7 @@ document.addEventListener('submit', async e => {
 
 const VIEWS = {
   overview() {
-    const { cards, t } = kpiData();
-    return `${t.warn.map(w => `<div class="card err">${esc(w)} – set it in Settings.</div>`).join('')}
-    <div class="grid">${cards.map(k => {
-      const v = k.cur;
-      const ch = (k.prev != null && v != null) ? chg(v, k.prev) : '';
-      return `<div class="kpi" data-click="kpi" data-k="${k.k}"><h4>${k.label}</h4><div class="v ${v != null && ['cf', 'profit', 'ach'].includes(k.k) ? (v > 0 ? 'pos' : v < 0 ? 'neg' : '') : ''}">${v == null ? 'Incomplete' : fmt(v)}</div>
-      <div class="s">${k.prev != null ? 'Prev: ' + fmt(k.prev) + '<br>' + ch : (k.note || '')}${k.sync ? '<br>Synced ' + dt(k.sync) : ''}</div></div>`;
-    }).join('')}</div>
-    ${dailyPanel()}
-    <p class="muted">নিচের গ্রাফে শিটের প্রতিটি হিসাব আলাদা। উপরে অঙ্ক, নিচে সময়। সবুজ আগের ঘরের চেয়ে বেড়েছে, লাল কমেছে। ডানে স্ক্রল করলে পুরনো সময়। বড় অঙ্ক লাখে, ছোট অঙ্ক টাকায়।</p>
-    ${historyCharts()}
-    <p class="muted">উপরের কার্ডে চাপ দিলে হিসাবের ভাঙন খুলবে।</p>`;
+    return overviewPage();
   },
 
   sheet() {
@@ -3990,6 +4048,24 @@ document.addEventListener('click', async e => {
   try {
     if (a === 'navgroup') { window.__navGroup = window.__navGroup === b.dataset.g ? '' : b.dataset.g; render(true); }
     else if (a === 'kpi') { $('#modalBody').innerHTML = breakdown(b.dataset.k); $('#modal').classList.remove('hidden'); }
+    else if (a === 'ovRange') {
+      const r = (b.getAttribute('data-r') || b.dataset.r || '').toUpperCase();
+      if (['1W', '1M', '3M', 'ALL'].includes(r)) {
+        window.__ovRange = r;
+        try { localStorage.setItem('hisab_ov_range', r); } catch { /* ignore */ }
+        render(true);
+      }
+    }
+    else if (a === 'ovSeries') {
+      const key = b.getAttribute('data-s') || b.dataset.s;
+      if (key === 'nw' || key === 'profit') {
+        const next = overviewSeriesState();
+        next[key] = !next[key];
+        if (!next.nw && !next.profit) next[key] = true; // keep at least one on
+        saveOverviewSeries(next);
+        render(true);
+      }
+    }
     else if (a === 'fwdSync') { await fwdPost('/api/forwarder/sync'); toast('Sync started'); setTimeout(fwdLoad, 800); }
     else if (a === 'fwdToggle') {
       const on = !window.__fwd?.settings?.enabled;

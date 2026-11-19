@@ -209,12 +209,59 @@ li.open > .calc-row .chev{transform:rotate(45deg);margin-top:3px}
 }
 .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;background:#eef2f6;font-weight:650}
 .pill.warn{background:#fef3c7;color:var(--amber)}.pill.ok{background:#e7f8ee;color:var(--green)}
-.chart-h{font-size:16px;margin:22px 0 10px;letter-spacing:-.02em}
 .card h3 b{font-variant-numeric:tabular-nums}
-.chart-scroll{overflow-x:auto;border:1px solid var(--line);border-radius:14px;background:#fff}
-svg.chart{display:block;background:#fff;font-family:"Segoe UI",system-ui,-apple-system,Roboto,sans-serif}
-svg.chart text{font-family:inherit}
 .bar{height:10px;background:var(--brand);border-radius:5px}
+
+/* ---------- Overview (net worth) ---------- */
+.ov{display:flex;flex-direction:column;gap:14px;max-width:920px}
+.ov .card{margin-bottom:0}
+.ov-kicker{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:0 0 6px}
+.ov-hero{padding:22px 22px 18px}
+.ov-big{font-size:34px;font-weight:750;letter-spacing:-.04em;line-height:1.15;font-variant-numeric:tabular-nums}
+.ov-sub{margin:8px 0 14px;font-size:14px;font-weight:600;color:var(--muted)}
+.ov-sub.pos{color:var(--green)}.ov-sub.neg{color:var(--red)}
+.ov-tools{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin:2px 0 12px}
+.ov-series,.ov-ranges{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.ov-tog,.ov-range{border:1px solid var(--line);background:#fff;border-radius:99px;padding:6px 12px;cursor:pointer;font:inherit;font-size:12.5px;font-weight:650;color:var(--muted);display:inline-flex;align-items:center;gap:7px;transition:background .12s,color .12s,border-color .12s,box-shadow .12s}
+.ov-tog:hover,.ov-range:hover{background:#f8fafc;color:var(--ink)}
+.ov-tog.on{background:#f0fdfa;color:var(--brand2);border-color:#99f6e4;box-shadow:0 0 0 1px rgba(15,118,110,.06)}
+.ov-tog.on[data-s="profit"]{background:#f0f9ff;color:#0369a1;border-color:#bae6fd}
+.ov-range.on{background:var(--ink);color:#fff;border-color:var(--ink);box-shadow:0 1px 2px rgba(20,32,43,.18)}
+.ov-dot{width:8px;height:8px;border-radius:99px;background:#cbd5e1;flex-shrink:0}
+.ov-tog.on .ov-dot.nw{background:#0f766e}
+.ov-tog.on .ov-dot.profit{background:#0369a1}
+.ov-chart{margin:0;border-radius:12px;overflow:hidden;background:linear-gradient(180deg,#f8fbfa 0%,#fff 72%);border:1px solid #eef2f6}
+.ov-chart.twin .ov-panel + .ov-panel{border-top:1px solid #eef2f6}
+.ov-panel{position:relative;padding:6px 0 2px}
+.ov-panel-lab{position:absolute;top:8px;left:10px;z-index:1;font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#94a3b8;pointer-events:none}
+.ov-panel-lab.nw{color:#0f766e}.ov-panel-lab.profit{color:#0369a1}
+.ov-chart .ov-svg,.ov-chart svg{display:block;width:100%;height:auto}
+.ov-empty{margin:18px 0;text-align:center}
+.ov-split{display:grid;grid-template-columns:1.1fr 1fr;gap:14px}
+.ov-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;margin-bottom:4px}
+.ov-head .ov-kicker{margin:0}
+.ov-exfin{display:inline-flex;align-items:center;gap:6px;flex-direction:row;font-size:12px;color:var(--muted);font-weight:550;cursor:pointer;user-select:none;margin:0}
+.ov-exfin input{margin:0;width:auto}
+.ov-today .ov-big{font-size:28px;margin-top:4px}
+.ov-note{margin:10px 0 0;font-size:13px}
+.ov-parts{list-style:none;margin:4px 0 0;padding:0}
+.ov-parts li{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:11px 4px;border-bottom:1px solid var(--line);cursor:pointer;font-size:14px}
+.ov-parts li:hover{background:#f8fafc;margin:0 -8px;padding-left:12px;padding-right:12px;border-radius:8px}
+.ov-parts li:last-child{border-bottom:0}
+.ov-parts li span{color:var(--muted);font-weight:550}
+.ov-parts li b{font-weight:700;font-variant-numeric:tabular-nums}
+.ov-parts li.tot{margin-top:4px;padding-top:14px;border-top:1px solid var(--line);border-bottom:0}
+.ov-parts li.tot span,.ov-parts li.tot b{color:var(--ink);font-weight:750}
+.ov-days .ov-kicker{margin-bottom:10px}
+.ov-tw{max-height:none;box-shadow:none}
+.ov-tw table{font-size:13px}
+@media(max-width:780px){
+  .ov-big{font-size:28px}
+  .ov-split{grid-template-columns:1fr}
+  .ov-hero{padding:18px 16px 14px}
+  .ov-tools{flex-direction:column;align-items:stretch}
+  .ov-series,.ov-ranges{justify-content:flex-start}
+}
 @media(max-width:780px){
   .app{flex-direction:column}
   aside{display:none}
