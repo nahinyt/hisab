@@ -14,8 +14,9 @@ import { addDocRow, firestoreConfigured, getMainSettings, listDocs, listSnapshot
 const TZ = 'Asia/Dhaka';
 const USDT_DUE_ID = 'usdt-due';
 const ECOM_SALE = new Set(['Ecomdrive · Shipped', 'Ecomdrive · Pending', 'Ecomdrive · RTS', 'Ecomdrive · Pending Return']);
-const ECOM_FEE = new Set([]);
+const ECOM_FEE = new Set(['Ecomdrive · Shipped delivery', 'Ecomdrive · Pending delivery', 'Ecomdrive · RTS delivery', 'Ecomdrive · Pending Return delivery']);
 const AWAITING = 'Steadfast · Awaiting approval';
+const feeNameOf = saleName => saleName + ' delivery';
 /** ৳1000 BDT in minor units (paisa = taka × 100). */
 const BOUNCE_TAKA = 1000;
 const BOUNCE_THRESHOLD_MINOR = BOUNCE_TAKA * 100;
@@ -181,8 +182,11 @@ function collapse(items) {
   return out;
 }
 
-function deliveryMinor(name, list) {
-  return 0;
+/** Same as app.js: delivery charge off the matching sale before COD. */
+function deliveryMinor(saleName, list, settings) {
+  const it = (list || []).find(i => !i.archived && i.name === feeNameOf(saleName) && i.include !== false);
+  if (!it) return 0;
+  return Math.abs(toBase(it.balance || 0, it.currency, settings));
 }
 
 function compute(items, settings) {
@@ -191,7 +195,7 @@ function compute(items, settings) {
   const list = collapse(items);
   for (const it of list) {
     let v = toBase(it.balance || 0, it.currency, settings);
-    if (ECOM_SALE.has(it.name)) v = afterCod(v - deliveryMinor(it.name, list), settings);
+    if (ECOM_SALE.has(it.name)) v = afterCod(v - deliveryMinor(it.name, list, settings), settings);
     else if (it.name === AWAITING) v = afterCod(v, settings);
     const inc = isCountOff(settings, it.name) ? false : it.include !== false;
     parts.push({ it, v, inc });
