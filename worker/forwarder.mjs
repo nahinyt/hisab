@@ -466,6 +466,54 @@ export async function refreshCourierTracking({ invoiceIds = null, limit = TRACK_
   return { ok: true, updated, errors, checked: rows.length };
 }
 
+/** Steadfast/Packzy tracking text that means COD is no longer "open" with the courier. */
+function isClosedCourierStatus(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
+  return /delivered|partial\s*delivered|returned|return\s*to\s*merchant|cancelled|canceled|lost|destroyed|disposed/.test(t);
+}
+
+/**
+ * Compact list of consignments still "open" at Steadfast (for Live Sheet loss diffs).
+ * Source: forwarder SQLite — invoice_id / name / phone / COD already collected for PackKoro.
+ * Open ≈ Steadfast courier (or SHIPPED/RTS) whose latest tracking is not delivered/returned.
+ */
+export function listOpenSteadfastConsignments({ limit = 600 } = {}) {
+  const cap = Math.min(800, Math.max(1, Number(limit) || 600));
+  let rows = [];
+  try {
+    openForwarder();
+    rows = d().prepare(`SELECT invoice_id, phone, name, cod_amount, courier, courier_code, ecom_status, courier_status
+      FROM invoices
+      WHERE LOWER(COALESCE(courier_code, '')) IN ('steadfast', 'packzy')
+         OR LOWER(COALESCE(courier, '')) LIKE '%steadfast%'
+         OR LOWER(COALESCE(courier, '')) LIKE '%packzy%'
+      ORDER BY COALESCE(cod_amount, 0) DESC, last_seen_at DESC
+      LIMIT ?`).all(cap * 2);
+  } catch (err) {
+    return { ok: false, error: err.message || String(err), open: [], count: 0, cod: 0 };
+  }
+  const open = [];
+  for (const row of rows) {
+    if (isClosedCourierStatus(row.courier_status)) continue;
+    const ecom = String(row.ecom_status || '').toUpperCase();
+    // Pending without a Steadfast handoff rarely sits in courier balance; keep SHIPPED/RTS + any with tracking text.
+    if (ecom === 'PENDING' && !row.courier_status) continue;
+    const id = String(row.invoice_id || '').trim();
+    if (!id) continue;
+    open.push({
+      i: id,
+      n: String(row.name || '').trim().slice(0, 80),
+      p: String(row.phone || '').trim().slice(0, 20),
+      c: Math.round(Number(row.cod_amount) || 0),
+      s: String(row.courier_status || ecom || '').trim().slice(0, 60)
+    });
+    if (open.length >= cap) break;
+  }
+  const cod = open.reduce((sum, x) => sum + (Number(x.c) || 0), 0);
+  return { ok: true, open, count: open.length, cod };
+}
+
 /** Cached timeline + optional live Packzy refresh for one invoice. */
 export async function getCourierTracking(invoiceId, { live = true } = {}) {
   const id = String(invoiceId || '').trim();

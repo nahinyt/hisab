@@ -2814,6 +2814,81 @@ function pipelineRoutes(names) {
   }
   return routes;
 }
+/** Steadfast open-invoice snapshot on a Live Sheet row (from Calculate / forwarder DB). */
+function sfOf(snap) {
+  return snap && snap.sf && typeof snap.sf === 'object' ? snap.sf : null;
+}
+function sfInvoiceRows(list) {
+  return (Array.isArray(list) ? list : []).map(x => ({
+    id: x.i || x.invoiceId || x.invoice_id || '',
+    name: x.n || x.name || '',
+    phone: x.p || x.phone || '',
+    cod: Number(x.c ?? x.cod ?? x.cod_amount) || 0,
+    status: x.s || x.status || ''
+  })).filter(x => x.id);
+}
+function fmtTaka(n) {
+  return '৳' + Math.round(Number(n) || 0).toLocaleString('en-IN');
+}
+function sfLeftTable(list, emptyNote) {
+  const rows = sfInvoiceRows(list);
+  if (!rows.length) return `<p class="muted">${esc(emptyNote || 'কোনো ইনভয়েস নেই।')}</p>`;
+  const codSum = rows.reduce((s, r) => s + r.cod, 0);
+  const body = rows.map(r => `<tr>
+      <td><b>${esc(r.id)}</b></td>
+      <td>${esc(r.name || '—')}</td>
+      <td>${esc(r.phone || '—')}</td>
+      <td class="n">${fmtTaka(r.cod)}</td>
+      <td>${esc(r.status || '—')}</td>
+    </tr>`).join('');
+  return `<div class="tw sf-left-wrap"><table class="sf-left">
+    <tr><th>Invoice</th><th>নাম</th><th>ফোন</th><th class="n">COD</th><th>স্ট্যাটাস</th></tr>
+    ${body}
+    <tr class="t"><td colspan="3">মোট ${rows.length}টা</td><td class="n">${fmtTaka(codSum)}</td><td></td></tr>
+  </table></div>
+  <p class="muted">এগুলো আগের Calculate-এর ওপেন সেট থেকে উধাও — ডেলিভার্ড / রিটার্ন / স্ট্যাটাস বদল হতে পারে।</p>`;
+}
+function sheetSfGoneHtml(id) {
+  const cur = S.snapshots.find(s => s.id === id);
+  if (!cur) return '<p>এই সারি আর খুঁজে পাওয়া যায়নি।</p>';
+  const sf = sfOf(cur);
+  const courierDown = (() => {
+    const snaps = sortedSnaps();
+    const i = snaps.findIndex(s => s.id === id);
+    const prev = i > 0 ? snaps[i - 1] : null;
+    if (!prev) return false;
+    return (cur.totals?.courier || 0) < (prev.totals?.courier || 0);
+  })();
+  const left = sf?.left || [];
+  const head = `<h3>কী গেল? · Steadfast</h3>
+    <p class="sheet-id">সারি <code>${esc(cur.id)}</code> · ${esc(dt(cur.ts))}</p>
+    <p class="muted">কুরিয়ার মোট ${fmt(cur.totals?.courier)}${courierDown ? ' · আগের সারি থেকে কমেছে' : ''} · ওপেন ইনভয়েস ${sf?.ok === false ? 'পাওয়া যায়নি' : ((sf?.n ?? '—') + 'টা / ' + fmtTaka(sf?.cod || 0))}</p>`;
+  if (!sf) {
+    return head + '<p class="muted">এই সারিতে Steadfast ইনভয়েস স্ন্যাপশট নেই (পুরনো সারি, বা Calculate-এর আগে ফিচার)। নতুন Calculate চালালে ধরা শুরু হবে।</p>';
+  }
+  if (sf.ok === false) {
+    return head + `<p class="err">ইনভয়েস লিস্ট নেওয়া যায়নি: ${esc(sf.error || 'unknown')}। শিটের টোটাল ঠিকই সেভ হয়েছে।</p>`;
+  }
+  if (!left.length) {
+    return head + `<p>এই স্টেপে কোনো ইনভয়েস Steadfast ওপেন সেট থেকে যায়নি।${courierDown ? ' কুরিয়ার কমার কারণ অন্য ঘর (Pathao / unpaid / charge) হতে পারে।' : ''}</p>
+      <p class="muted">এখন ওপেন: ${sf.n || 0}টা · ${fmtTaka(sf.cod || 0)}</p>`;
+  }
+  return head + '<h4>যে ইনভয়েসগুলো চলে গেছে</h4>' + sfLeftTable(left)
+    + (sf.added?.length ? `<details class="sf-added"><summary>নতুন এসেছে (${sf.added.length})</summary>${sfLeftTable(sf.added, 'নেই')}</details>` : '');
+}
+function sheetSfArchiveHtml() {
+  const snaps = sortedSnaps().filter(s => sfInvoiceRows(sfOf(s)?.left).length).reverse().slice(0, 12);
+  if (!snaps.length) return '';
+  const items = snaps.map(s => {
+    const left = sfInvoiceRows(sfOf(s).left);
+    const cod = left.reduce((n, r) => n + r.cod, 0);
+    return `<button type="button" class="btn sm" data-click="sheetSfGone" data-id="${esc(s.id)}">${esc(dt(s.ts))} · ${left.length}টা · ${fmtTaka(cod)}</button>`;
+  }).join(' ');
+  return `<div class="card sf-archive"><h3>Steadfast · চলে যাওয়া (আর্কাইভ)</h3>
+    <p class="muted">Calculate-এর পর যে ইনভয়েস ওপেন সেট থেকে উধাও হয়েছে — পরে দেখতে চাপুন।</p>
+    <div class="sf-archive-list">${items}</div></div>`;
+}
+
 function sheetWhy(id, prevId) {
   const cur = S.snapshots.find(s => s.id === id);
   const prev = prevId ? S.snapshots.find(s => s.id === prevId) : null;
@@ -3324,9 +3399,17 @@ function sheetWhy(id, prevId) {
   const leftHtml = left.map(p => `<div class="flow-one ${p.left > 0 ? 'up' : 'down'}"><b>${p.left > 0 ? '▲' : '▼'} ${fmt(Math.abs(p.left))}</b> ${esc(shortName(p.name))}<p>${esc(leftoverText(p))}</p></div>`).join('');
   const sumBit = x => x.plain ? `${esc(shortName(x.name))} ${fmt(x.amt)}` : `${esc(shortName(x.name))} ${x.up ? '▲' : '▼'} ${fmt(x.amt)}`;
   const sumItem = (s, i) => `<li><b>${i + 1}.</b> ${s.from.map(sumBit).join(' + ')} → ${s.to.map(sumBit).join(' + ')}</li>`;
+  const sf = sfOf(cur);
+  const sfLeft = sfInvoiceRows(sf?.left);
+  const sfBlock = sfLeft.length
+    ? `<h4>Steadfast থেকে চলে গেছে (${sfLeft.length})</h4>${sfLeftTable(sfLeft)}`
+    : (pool.some(p => (p.kind === 'steadfast' || p.kind === 'courier') && p.delta < 0) && sf
+      ? `<p class="muted">কুরিয়ার কমেছে, কিন্তু এই স্টেপে ওপেন ইনভয়েস সেট থেকে কেউ যায়নি (অথবা লিস্ট পাওয়া যায়নি)। <button type="button" class="btn sm" data-click="sheetSfGone" data-id="${esc(cur.id)}">কী গেল?</button></p>`
+      : '');
   return head + (stories.length ? `<ol class="move-sum">${stories.map(sumItem).join('')}</ol>` : '') + `<div class="move-cols"><div class="down"><h4>কমেছে</h4>${downs.map(line).join('') || '<p class="muted">কিছু কমেনি</p>'}</div><div class="up"><h4>বেড়েছে</h4>${ups.map(line).join('') || '<p class="muted">কিছু বাড়েনি</p>'}</div></div>
     ${stories.length ? `<h4>এই জায়গা থেকে এই জায়গায়</h4>${stories.map(flowHtml).join('')}` : ''}
     ${leftHtml ? `<h4>যার জোড়া মেলেনি</h4>${leftHtml}` : ''}
+    ${sfBlock}
     <p class="muted">লাল মানে কমেছে, সবুজ মানে বেড়েছে। তীর মানে টাকা বা পণ্য ওই দিক থেকে ওই দিকে গেছে।</p>`;
 }
 
@@ -3644,7 +3727,12 @@ const VIEWS = {
         return diffCell(cur, prevV, false, fmt);
       };
       const picked = sel.has(r.id);
-      return `<tr class="${picked ? 'sheet-picked' : ''}"><td class="sheet-pick"><input type="checkbox" data-act="sheetPick" data-id="${esc(r.id)}" ${picked ? 'checked' : ''} title="Select row to merge"></td><td><div class="sheet-time">${dt(r.ts)}${foldBtn}</div></td>${items.map(cell).join('')}${tot.map(([k]) => diffCell(r.totals?.[k], prev ? prev.totals?.[k] : r.totals?.[k], true)).join('')}${diffCell(p, pp, true, sgn)}<td><span class="pill">${esc(r.source)}</span></td><td class="why"><button type="button" class="why-btn" data-click="sheetWhy" data-id="${esc(r.id)}" data-prev="${esc(prev?.id || '')}" title="কী বেড়েছে, কোথায় গেছে">i</button></td></tr>`;
+      const courierDown = prev && (r.totals?.courier || 0) < (prev.totals?.courier || 0);
+      const leftN = sfInvoiceRows(sfOf(r)?.left).length;
+      const sfBtn = leftN
+        ? `<button type="button" class="btn sm sf-gone" data-click="sheetSfGone" data-id="${esc(r.id)}" title="কোন ইনভয়েস Steadfast থেকে গেছে">কী গেল? (${leftN})</button>`
+        : (courierDown ? `<button type="button" class="btn sm sf-gone dim" data-click="sheetSfGone" data-id="${esc(r.id)}" title="কুরিয়ার কমেছে — ইনভয়েস দেখুন">কী গেল?</button>` : '');
+      return `<tr class="${picked ? 'sheet-picked' : ''}"><td class="sheet-pick"><input type="checkbox" data-act="sheetPick" data-id="${esc(r.id)}" ${picked ? 'checked' : ''} title="Select row to merge"></td><td><div class="sheet-time">${dt(r.ts)}${foldBtn}${sfBtn}</div></td>${items.map(cell).join('')}${tot.map(([k]) => diffCell(r.totals?.[k], prev ? prev.totals?.[k] : r.totals?.[k], true)).join('')}${diffCell(p, pp, true, sgn)}<td><span class="pill">${esc(r.source)}</span></td><td class="why"><button type="button" class="why-btn" data-click="sheetWhy" data-id="${esc(r.id)}" data-prev="${esc(prev?.id || '')}" title="কী বেড়েছে, কোথায় গেছে">i</button></td></tr>`;
     };
     const pager = shown.length
       ? `<div class="sheet-pager">
@@ -3662,7 +3750,8 @@ const VIEWS = {
     ${pager}
     <div class="tw"><table class="sheet"><tr><th class="sheet-pick"></th><th>Time (BST)</th>${items.map(i => `<th class="n">${esc(ECOM_SALE.has(i.name) ? shortName(i.name) : uiName(i.name))}</th>`).join('')}${tot.map(([, l]) => `<th class="n">${l}</th>`).join('')}<th class="n">Profit (today)</th><th>Source</th><th class="why"></th></tr>
     ${pageRows.map(rowHtml).join('') || '<tr><td colspan="99" class="muted">No rows yet.</td></tr>'}</table></div>
-    ${pager}`;
+    ${pager}
+    ${sheetSfArchiveHtml()}`;
   },
 
   errors() {
@@ -4177,6 +4266,11 @@ document.addEventListener('click', async e => {
     else if (a === 'delmap') { const k = S.connectors.find(x => x.id === window.__cid), i = parseInt(b.dataset.i, 10); if (k) { await A.set('connectors', k.id, { mappings: (k.mappings || []).filter((_, j) => j !== i) }); audit('connector.map.remove', k.name); } }
     else if (a === 'sheetWhy') {
       $('#modalBody').innerHTML = sheetWhy(id, b.dataset.prev || '');
+      const box = document.querySelector('.modal-box'); if (box) box.scrollTop = 0;
+      $('#modal').classList.remove('hidden');
+    }
+    else if (a === 'sheetSfGone') {
+      $('#modalBody').innerHTML = sheetSfGoneHtml(id);
       const box = document.querySelector('.modal-box'); if (box) box.scrollTop = 0;
       $('#modal').classList.remove('hidden');
     }

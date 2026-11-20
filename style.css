@@ -82,6 +82,14 @@ tr.tot td{font-weight:700;background:#f8fafc}
 .sheet td.up small{color:var(--green)}
 .sheet td.down small{color:var(--red)}
 .why-btn{width:28px;height:28px;border-radius:50%;border:1px solid #b7ebe3;background:#f3fbf9;color:var(--brand2);font-weight:700;font-family:Georgia,serif;font-style:italic;cursor:pointer;line-height:1}
+.sheet-time .sf-gone{margin-left:6px;vertical-align:middle}
+.sheet-time .sf-gone.dim{opacity:.7}
+.sf-left-wrap{margin:8px 0 4px}
+table.sf-left{font-size:13px}
+table.sf-left td,table.sf-left th{padding:6px 8px}
+.sf-added{margin:10px 0;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:#f8fafc}
+.sf-archive{margin-top:14px}
+.sf-archive-list{display:flex;flex-wrap:wrap;gap:8px}
 .sheet-id{margin:0 0 8px;font-size:13px}
 .sheet-id code{font-family:ui-monospace,Consolas,monospace;background:#f1f5f9;padding:2px 6px;border-radius:6px}
 .why-btn:hover{background:var(--brand);color:#fff;border-color:var(--brand)}

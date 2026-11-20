@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { checkAccounts, checkCourierHistory, checkDollar, checkExpenses, checkReport, checkStock, checkSuppliers } from './ecomdrive.mjs';
 import { checkSteadfast } from './steadfast.mjs';
 import { checkPathao } from './pathao.mjs';
+import { listOpenSteadfastConsignments } from './forwarder.mjs';
 import { withProgress, done as subDone, sub as subStart } from './progress.mjs';
 import { addDocRow, firestoreConfigured, getMainSettings, listDocs, listSnapshots, setDocMerge } from './firestore.mjs';
 
@@ -27,6 +28,9 @@ const dataDir = process.env.HISAB_DATA_DIR || workerDir;
 const smsPath = process.env.HISAB_SMS_FILE || path.join(dataDir, 'sms-balances.json');
 const localSheetPath = path.join(dataDir, 'local-sheet.json');
 const localCachePath = path.join(dataDir, 'local-cache.json');
+const localSfOpenPath = path.join(dataDir, 'local-sf-open.json');
+/** Cap open-invoice payload on each snapshot (ids + essentials only). */
+const SF_OPEN_CAP = 500;
 
 let busy = false;
 let lastRun = null;
@@ -344,6 +348,63 @@ function loadSms() {
   try { return JSON.parse(fs.readFileSync(smsPath, 'utf8')); } catch { return {}; }
 }
 
+function loadPrevSfOpen() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(localSfOpenPath, 'utf8'));
+    return Array.isArray(raw?.open) ? raw.open : [];
+  } catch {
+    try {
+      const sheet = JSON.parse(fs.readFileSync(localSheetPath, 'utf8'));
+      return Array.isArray(sheet?.sheetRow?.sf?.open) ? sheet.sheetRow.sf.open : [];
+    } catch {
+      return [];
+    }
+  }
+}
+
+function savePrevSfOpen(open, meta = {}) {
+  try {
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(localSfOpenPath, JSON.stringify({
+      savedAt: new Date().toISOString(),
+      count: open.length,
+      cod: open.reduce((s, x) => s + (Number(x.c) || 0), 0),
+      open,
+      ...meta
+    }));
+  } catch { /* ignore */ }
+}
+
+/** Compact Steadfast open set + removed/added vs previous Calculate snapshot. Soft-fails. */
+function captureSfSnapshot() {
+  try {
+    const listed = listOpenSteadfastConsignments({ limit: SF_OPEN_CAP });
+    if (!listed.ok) {
+      return { sf: { ok: false, error: listed.error || 'unavailable', n: 0, cod: 0, open: [], left: [], added: [] }, prevHad: false };
+    }
+    const open = (listed.open || []).slice(0, SF_OPEN_CAP);
+    const prev = loadPrevSfOpen();
+    const prevHad = prev.length > 0;
+    const curIds = new Set(open.map(x => x.i));
+    const prevMap = new Map(prev.map(x => [x.i, x]));
+    const left = prevHad ? prev.filter(x => x.i && !curIds.has(x.i)) : [];
+    const added = prevHad ? open.filter(x => x.i && !prevMap.has(x.i)) : [];
+    return {
+      sf: {
+        ok: true,
+        n: open.length,
+        cod: listed.cod || open.reduce((s, x) => s + (Number(x.c) || 0), 0),
+        open,
+        left: left.slice(0, SF_OPEN_CAP),
+        added: added.slice(0, 100)
+      },
+      prevHad
+    };
+  } catch (err) {
+    return { sf: { ok: false, error: err.message || String(err), n: 0, cod: 0, open: [], left: [], added: [] }, prevHad: false };
+  }
+}
+
 async function step(name, fn, steps) {
   const row = { name, status: 'run', detail: '', subs: [], startedAt: Date.now() };
   steps.push(row);
@@ -643,6 +704,18 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
         names[p.it.id] = p.it.name;
         values[p.it.id] = p.v;
       }
+      // Soft: invoice list from forwarder DB — never block sheet totals if SQLite/list fails.
+      subStart('Steadfast ওপেন ইনভয়েস ধরছি');
+      const { sf } = captureSfSnapshot();
+      // Cloud row keeps left/added + counts only (open set lives in local-sf-open.json for next diff).
+      const sfCloud = {
+        ok: !!sf.ok,
+        n: sf.n || 0,
+        cod: sf.cod || 0,
+        left: sf.left || [],
+        added: sf.added || [],
+        ...(sf.error ? { error: sf.error } : {})
+      };
       const row = {
         ts: now.toISOString(),
         date: dkDate(now),
@@ -661,7 +734,8 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
           assets: t.assets,
           liab: t.liab,
           nw: t.nw
-        }
+        },
+        sf: sfCloud
       };
       const calcAt = now.toISOString();
       let id = '';
@@ -696,6 +770,7 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
       } catch (err) {
         if (!cloudErr) cloudErr = err.message || String(err);
       }
+      if (sf.ok) savePrevSfOpen(sf.open || [], { left: (sf.left || []).length, snapId: id || '' });
       if (!cloudOk) {
         id = id || ('local_' + Date.now().toString(36));
         const sheetRow = { id, ...row };
@@ -722,9 +797,11 @@ export async function runCalculate({ source = 'calculate', by = 'server', _lockH
           cloudError: cloudErr || 'Firestore write failed'
         };
         saveLocalSheet({ ...fallbackPayload, paymentWatch });
-        return id + ' · nw=' + (t.nw / 100).toFixed(2) + ' · local (cloud quota)';
+        const leftBit = sf.ok && sf.left?.length ? ` · left ${sf.left.length}` : (sf.ok ? '' : ' · sf n/a');
+        return id + ' · nw=' + (t.nw / 100).toFixed(2) + ' · local (cloud quota)' + leftBit;
       }
-      return id + ' · nw=' + (t.nw / 100).toFixed(2);
+      const leftBit = sf.ok && sf.left?.length ? ` · left ${sf.left.length}` : (sf.ok ? ` · sf ${sf.n}` : ' · sf n/a');
+      return id + ' · nw=' + (t.nw / 100).toFixed(2) + leftBit;
     }, steps);
 
     lastRun = {
