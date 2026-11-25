@@ -33,6 +33,10 @@ const STALE_SENDING_MS = 10 * 60000;
 // at most MAX_PER_RUN per sync; the rest wait for the next sync in the same order.
 const SEND_GAP_MS = Number(process.env.FORWARDER_SEND_GAP_MS ?? 1100);
 const MAX_PER_RUN = Math.max(1, Number(process.env.FORWARDER_MAX_PER_RUN ?? 200) || 200);
+// PackKoro URL + Bearer key live in SQLite (Invoice Forwarder UI). Env is a silent last-resort
+// only when the kv row was never written — do not put real keys in .env for normal use.
+const ENV_API_URL = String(process.env.FORWARDER_API_URL || process.env.PACKKORO_INVOICE_URL || '').trim();
+const ENV_API_KEY = String(process.env.FORWARDER_API_KEY || process.env.PACKKORO_API_KEY || '').trim();
 
 let db = null;
 let dbPath = '';
@@ -147,18 +151,41 @@ export function getSourceStatuses() {
   return normalizeSourceStatuses(kvGet('source_statuses', '["PENDING"]'));
 }
 
-export function getSettings({ withKey = false } = {}) {
-  const key = kvGet('api_key');
+/** SQLite value if the row exists; otherwise `missing` (env may fill). Empty string means intentionally cleared. */
+function kvOrMissing(k) {
+  const row = d().prepare('SELECT v FROM kv WHERE k = ?').get(k);
+  return row ? { missing: false, v: row.v ?? '' } : { missing: true, v: '' };
+}
+
+function resolveSecret(k, envFallback) {
+  const row = kvOrMissing(k);
+  if (!row.missing) return String(row.v || '').trim();
+  return String(envFallback || '').trim();
+}
+
+/**
+ * Public shape for HTTP responses — never includes the raw API key.
+ * Use getSettings({ withKey: true }) only inside the worker for outbound PackKoro calls.
+ */
+export function publicSettings() {
+  const key = resolveSecret('api_key', ENV_API_KEY);
+  const apiUrl = resolveSecret('api_url', ENV_API_URL);
   return {
-    apiUrl: kvGet('api_url'),
+    apiUrl,
     enabled: kvGet('enabled', '0') === '1',
     intervalMin: Math.max(1, Number(kvGet('interval_min', '5')) || 5),
     noMatchRetryMin: Math.max(5, Number(kvGet('no_match_retry_min', '30')) || 30),
     sourceStatuses: getSourceStatuses(),
     hasKey: !!key,
-    keyMask: key ? '••••' + key.slice(-4) : '',
-    ...(withKey ? { apiKey: key } : {})
+    keyMask: key ? '••••' + key.slice(-4) : ''
   };
+}
+
+export function getSettings({ withKey = false } = {}) {
+  // Invoice Forwarder UI → SQLite is the source of truth. Env fills only when the kv row was never set.
+  const pub = publicSettings();
+  if (!withKey) return pub;
+  return { ...pub, apiKey: resolveSecret('api_key', ENV_API_KEY) };
 }
 
 export function saveSettings(patch = {}) {
@@ -188,7 +215,7 @@ export function saveSettings(patch = {}) {
   if (patch.sourceStatuses != null) {
     kvSet('source_statuses', JSON.stringify(normalizeSourceStatuses(patch.sourceStatuses)));
   }
-  return getSettings();
+  return publicSettings();
 }
 
 // ---------- validation / mapping ----------
@@ -771,7 +798,7 @@ export function forwarderStatus({ filter = '', search = '', limit = 200 } = {}) 
       ORDER BY COALESCE(last_attempt_at, first_seen_at) DESC LIMIT ?`).all(...args, Math.min(500, limit));
   let lastRun = null;
   try { lastRun = JSON.parse(kvGet('last_run') || 'null'); } catch { /* ignore */ }
-  const s = getSettings();
+  const s = publicSettings();
   const lastAttempt = d().prepare('SELECT http_status, result, at FROM attempts ORDER BY id DESC LIMIT 1').get();
   const connection = !s.apiUrl || !s.hasKey ? { state: 'not_configured', text: 'Not configured' }
     : !lastAttempt ? { state: 'unknown', text: 'No requests yet' }
@@ -783,7 +810,7 @@ export function forwarderStatus({ filter = '', search = '', limit = 200 } = {}) 
 }
 
 export function attemptLog(invoiceId) {
-  const s = getSettings();
+  const s = publicSettings();
   const rows = d().prepare('SELECT at, http_status, result, response, request_url, request_body, duration_ms, stage FROM attempts WHERE invoice_id = ? ORDER BY id DESC LIMIT 50').all(invoiceId);
   return rows.map(r => ({ ...r, request: rawRequest(r.request_url, r.request_body, s.keyMask) }));
 }
@@ -811,7 +838,7 @@ function rawRequest(url, bodyJson, keyMask) {
 export function previewRequest(invoiceId) {
   const row = d().prepare('SELECT * FROM invoices WHERE invoice_id = ?').get(invoiceId);
   if (!row) throw new Error('Invoice not found');
-  const s = getSettings();
+  const s = publicSettings();
   const body = JSON.stringify(payloadOf(row));
   return { invoice_id: invoiceId, status: row.status, request: rawRequest(s.apiUrl || 'https://(set-api-url)/', body, s.keyMask), configured: !!(s.apiUrl && s.hasKey) };
 }

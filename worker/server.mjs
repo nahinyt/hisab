@@ -377,9 +377,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ---------- Ecom Drive → PackKoro invoice forwarder (session-gated above) ----------
+  // ---------- Ecom Drive → PackKoro invoice forwarder ----------
+  // Secrets (api_url / api_key) live in SQLite. Always require Hisab session when a password
+  // exists — even on loopback — so local scrapers / other apps cannot read or change them.
   if (url.pathname.startsWith('/api/forwarder/')) {
     const json = (code, body) => send(res, code, JSON.stringify(body), 'application/json; charset=utf-8', origin);
+    if (hasPassword() && !sessionOk(readCookie(req, 'hisab_session'))) {
+      json(401, { error: 'Sign in required', setup: false });
+      return;
+    }
     try {
       if (req.method === 'GET' && url.pathname === '/api/forwarder/status') {
         json(200, forwarderStatus({ filter: url.searchParams.get('filter') || '', search: url.searchParams.get('q') || '' }));
@@ -400,6 +406,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (req.method === 'POST') {
         const body = JSON.parse(await readBody(req, 4000) || '{}');
+        // saveForwarderSettings → publicSettings(): hasKey + keyMask only, never raw apiKey
         if (url.pathname === '/api/forwarder/settings') { json(200, { settings: saveForwarderSettings(body) }); return; }
         if (url.pathname === '/api/forwarder/sync') {
           runSync({ trigger: 'manual' }).catch(err => console.error('forwarder sync', err.message || err));

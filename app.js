@@ -3786,7 +3786,7 @@ const VIEWS = {
     <div id="fwdLive">${fwdLiveHtml(st)}</div>
     <div class="card fwd-cfg"><h3>Settings</h3>
       <form class="form" data-fwd-form="cfg">
-        <label>Destination API URL<input name="apiUrl" type="url" required placeholder="https://packkoro.com/api/ecomdrive/invoice" value="${esc(s.apiUrl)}"></label>
+        <label>Destination API URL<input name="apiUrl" type="url" required placeholder="https://packkoro.com.bd/api/ecomdrive/invoice" value="${esc(s.apiUrl)}"></label>
         <label>API key <small class="muted">${s.hasKey ? 'saved ' + esc(s.keyMask) + ' — leave empty to keep' : 'not set'}</small><input name="apiKey" type="password" autocomplete="new-password" placeholder="${s.hasKey ? '••••••••' : 'Bearer token'}"></label>
         <label>Polling interval (minutes)<input name="intervalMin" type="number" min="1" max="1440" value="${s.intervalMin}"></label>
         <fieldset class="fwd-sources"><legend>Fill from Ecom Drive</legend>
@@ -3797,7 +3797,7 @@ const VIEWS = {
         </fieldset>
         <div class="fwd-form-btns"><button class="btn primary">Save settings</button> <button type="button" class="btn" data-click="fwdTest">Test connection</button></div>
       </form>
-      <p class="muted">API key সার্ভারে থাকে, ব্রাউজারে ফেরত আসে না। পাঠানো হয় <code>Authorization: Bearer …</code> হেডারে। Body হুবহু: <code>{"phone","name","address","cod_amount","invoice_id"}</code>।</p>
+      <p class="muted">URL ও API key এই ফর্মে সেভ হয় (সার্ভার SQLite) — <code>.env</code>-এ রাখার দরকার নেই। Key ব্রাউজারে ফেরত আসে না (শুধু শেষ ৪ অক্ষর)। পাঠানো হয় <code>Authorization: Bearer …</code> হেডারে।</p>
     </div>`;
   },
 
