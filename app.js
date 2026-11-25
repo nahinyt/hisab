@@ -2403,6 +2403,7 @@ function render(force) {
   const a = document.activeElement;
   if (!force && a && a.closest('main') && ['INPUT', 'SELECT', 'TEXTAREA'].includes(a.tagName)) { pendingRender = true; return; }
   pendingRender = false;
+  if (page === 'forwarder') fwdCaptureDraft();
   try {
     const errCount = visibleSyncErrors().length;
     const link = ([k, l]) => `<a href="#/${k}" class="${k === page ? 'on' : ''}">${esc(l)}${k === 'errors' && errCount ? ` (${errCount})` : ''}</a>`;
@@ -2427,7 +2428,18 @@ function render(force) {
     try { $('#main').innerHTML = `<div class="card err">Display failed: ${esc(msg)}</div>`; } catch { /* ignore */ }
   }
 }
-function route() { page = (location.hash.replace('#/', '') || 'overview'); window.__navGroup = ''; tabGroup = null; render(true); }
+function route() {
+  const next = (location.hash.replace('#/', '') || 'overview');
+  if (page === 'forwarder' && next !== 'forwarder') {
+    window.__fwdDraft = null;
+    window.__fwdOptimistic = null;
+    if (window.__fwdTimer) { clearInterval(window.__fwdTimer); window.__fwdTimer = null; }
+  }
+  page = next;
+  window.__navGroup = '';
+  tabGroup = null;
+  render(true);
+}
 function headerStats() {
   const t = compute(), last = latestSnap(), profit = last ? profitCalc()(last) : null;
   let expense = null;
@@ -3534,6 +3546,29 @@ const FWD_STATUS = {
   new: ['Queued', 'pending'], sending: ['Sending', 'pending'], forwarded: ['Matched', 'ok'], exists: ['Matched', 'ok'],
   no_match: ['Not matched', 'warn'], failed: ['Error', 'fail'], invalid: ['Error', 'fail']
 };
+/** Capture settings form draft so Firestore/poll re-renders do not wipe an in-progress URL edit. */
+function fwdCaptureDraft() {
+  const f = document.querySelector('[data-fwd-form]');
+  if (!f) return;
+  const apiUrl = f.querySelector('[name="apiUrl"]');
+  const intervalMin = f.querySelector('[name="intervalMin"]');
+  if (!apiUrl && !intervalMin) return;
+  window.__fwdDraft = {
+    apiUrl: apiUrl ? apiUrl.value : '',
+    intervalMin: intervalMin ? intervalMin.value : '',
+    sourceStatuses: [...f.querySelectorAll('[name="sourceStatuses"]:checked')].map(el => el.value)
+  };
+}
+function fwdFormSettings(s) {
+  const d = window.__fwdDraft;
+  if (!d) return s;
+  return {
+    ...s,
+    apiUrl: d.apiUrl != null ? d.apiUrl : s.apiUrl,
+    intervalMin: d.intervalMin !== '' && d.intervalMin != null ? (Number(d.intervalMin) || s.intervalMin) : s.intervalMin,
+    sourceStatuses: Array.isArray(d.sourceStatuses) && d.sourceStatuses.length ? d.sourceStatuses : s.sourceStatuses
+  };
+}
 function fwdEnsurePolling() {
   if (window.__fwdTimer) return;
   window.__fwdTimer = setInterval(() => {
@@ -3543,12 +3578,18 @@ function fwdEnsurePolling() {
   fwdLoad();
 }
 async function fwdLoad() {
+  const seq = (window.__fwdSeq = (window.__fwdSeq || 0) + 1);
   try {
     const q = new URLSearchParams({ filter: window.__fwdFilter || '', q: window.__fwdQ || '' });
     const res = await api('/api/forwarder/status?' + q, { timeoutMs: 15000 });
     const body = await res.json().catch(() => ({}));
+    if (seq !== window.__fwdSeq) return; // stale response — a newer load or save already won
     if (res.status === 401) { demandHisabLogin(!!body.setup, 'Invoice Forwarder-এর জন্য সাইন-ইন লাগবে।'); return; }
     if (!res.ok) throw new Error(body.error || 'Could not load forwarder');
+    // Keep optimistic settings if a save just patched them and poll is still catching up.
+    if (window.__fwdOptimistic && body.settings) {
+      body.settings = { ...body.settings, ...window.__fwdOptimistic };
+    }
     const first = !window.__fwd;
     window.__fwd = body;
     if (page !== 'forwarder') return;
@@ -3559,6 +3600,7 @@ async function fwdLoad() {
       fwdPaintButtons(body);
     }
   } catch (err) {
+    if (seq !== window.__fwdSeq) return;
     const live = $('#fwdLive');
     if (live && !live.querySelector('.fwd-loaderr')) live.insertAdjacentHTML('afterbegin', `<div class="card err fwd-loaderr">${esc(err.message)}</div>`);
   }
@@ -3665,11 +3707,31 @@ document.addEventListener('submit', async e => {
   };
   if (String(fd.get('apiKey') || '').trim()) patch.apiKey = fd.get('apiKey');
   try {
-    await fwdPost('/api/forwarder/settings', patch);
-    f.querySelector('[name="apiKey"]').value = '';
+    const data = await fwdPost('/api/forwarder/settings', patch);
+    const saved = data.settings || {};
+    // Optimistic + seq: never null __fwd (that races with the 5s poll and restores the old URL).
+    window.__fwdSeq = (window.__fwdSeq || 0) + 1;
+    window.__fwdOptimistic = {
+      apiUrl: saved.apiUrl != null ? saved.apiUrl : String(patch.apiUrl || '').trim(),
+      intervalMin: saved.intervalMin != null ? saved.intervalMin : Number(patch.intervalMin) || undefined,
+      sourceStatuses: saved.sourceStatuses || patch.sourceStatuses,
+      hasKey: saved.hasKey,
+      keyMask: saved.keyMask
+    };
+    if (window.__fwd?.settings) {
+      window.__fwd.settings = { ...window.__fwd.settings, ...window.__fwdOptimistic };
+    }
+    window.__fwdDraft = null;
+    const keyInput = f.querySelector('[name="apiKey"]');
+    if (keyInput) keyInput.value = '';
+    const urlInput = f.querySelector('[name="apiUrl"]');
+    if (urlInput && window.__fwdOptimistic.apiUrl != null) urlInput.value = window.__fwdOptimistic.apiUrl;
     toast('Forwarder settings saved');
-    window.__fwd = null;
     await fwdLoad();
+    // Clear optimistic overlay once a post-save load has applied server truth.
+    if (window.__fwd?.settings?.apiUrl === window.__fwdOptimistic?.apiUrl) {
+      window.__fwdOptimistic = null;
+    }
   } catch (err) { toast(err.message); }
 }, true);
 
@@ -3773,7 +3835,7 @@ const VIEWS = {
     fwdEnsurePolling();
     const st = window.__fwd;
     if (!st) return '<div class="card"><p class="muted">Loading invoice forwarder…</p></div>';
-    const s = st.settings;
+    const s = fwdFormSettings(st.settings || {});
     const src = new Set(Array.isArray(s.sourceStatuses) && s.sourceStatuses.length ? s.sourceStatuses : ['PENDING']);
     const srcBox = (val, label) => `<label class="fwd-src"><input type="checkbox" name="sourceStatuses" value="${val}" ${src.has(val) ? 'checked' : ''}> ${label}</label>`;
     return `<div class="fwd-switch ${s.enabled ? 'on' : ''}">
@@ -3786,7 +3848,7 @@ const VIEWS = {
     <div id="fwdLive">${fwdLiveHtml(st)}</div>
     <div class="card fwd-cfg"><h3>Settings</h3>
       <form class="form" data-fwd-form="cfg">
-        <label>Destination API URL<input name="apiUrl" type="url" required placeholder="https://packkoro.com.bd/api/ecomdrive/invoice" value="${esc(s.apiUrl)}"></label>
+        <label>Destination API URL<input name="apiUrl" type="url" required placeholder="https://packkoro.com.bd/api/ecomdrive/invoice" value="${esc(s.apiUrl || '')}"></label>
         <label>API key <small class="muted">${s.hasKey ? 'saved ' + esc(s.keyMask) + ' — leave empty to keep' : 'not set'}</small><input name="apiKey" type="password" autocomplete="new-password" placeholder="${s.hasKey ? '••••••••' : 'Bearer token'}"></label>
         <label>Polling interval (minutes)<input name="intervalMin" type="number" min="1" max="1440" value="${s.intervalMin}"></label>
         <fieldset class="fwd-sources"><legend>Fill from Ecom Drive</legend>
@@ -4309,6 +4371,10 @@ document.addEventListener('click', async e => {
       finally { window.__sheetClearing = false; render(true); }
     }
     else if (a === 'logout') {
+      // Persist intent across reload — localhost loopback otherwise skips the login gate.
+      try { localStorage.setItem('hisab_signed_out', '1'); } catch { /* ignore */ }
+      window.__signedOut = true;
+      window.__hisabSessionOk = false;
       try { await api('/api/logout', { method: 'POST' }); } catch { /* session may already be gone */ }
       try { if (!DEMO) await A.auth?.logout?.(); } catch { /* ignore */ }
       location.reload();
@@ -4645,6 +4711,9 @@ document.addEventListener('submit', async e => {
         return;
       }
     }
+    try { localStorage.removeItem('hisab_signed_out'); } catch { /* ignore */ }
+    window.__signedOut = false;
+    window.__hisabSessionOk = true;
     user = email;
     $('#password').value = '';
     $('#password2').value = '';
@@ -4718,11 +4787,14 @@ function start() {
 }
 (async function boot() {
   A = DEMO ? localAdapter() : await fsAdapter();
+  let signedOut = false;
+  try { signedOut = localStorage.getItem('hisab_signed_out') === '1'; } catch { /* ignore */ }
   const gate = await apiGate();
-  if (gate.gate) {
-    // Production: do not auto-anonymous into the app — Calculate APIs need hisab_session first.
+  // Localhost loopback lets APIs through without hisab_session, so logout must force the login UI.
+  if (gate.gate || signedOut) {
     window.__hisabSessionOk = false;
-    showLogin(gate.setup, gate.offline);
+    window.__signedOut = !!signedOut;
+    showLogin(gate.setup, gate.offline && !signedOut);
     return;
   }
   window.__hisabSessionOk = true;
