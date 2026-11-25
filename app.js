@@ -3531,15 +3531,9 @@ function itemStatement(id) {
 
 // ---------- Invoice forwarder (Ecom Drive → PackKoro) ----------
 const FWD_STATUS = {
-  new: ['Queued', 'pending'], sending: ['Sending', 'pending'], forwarded: ['Received', 'ok'], exists: ['Received', 'ok'],
-  no_match: ['Not received', 'warn'], failed: ['Error', 'fail'], invalid: ['Error', 'fail']
+  new: ['Queued', 'pending'], sending: ['Sending', 'pending'], forwarded: ['Matched', 'ok'], exists: ['Matched', 'ok'],
+  no_match: ['Not matched', 'warn'], failed: ['Error', 'fail'], invalid: ['Error', 'fail']
 };
-function fwdIsReceived(r) {
-  return r.received === 1 || r.received === true || ['forwarded', 'exists'].includes(r.status);
-}
-function fwdIsSent(r) {
-  return !!(r.sent_at || r.attempts > 0 || ['sending', 'forwarded', 'exists', 'no_match', 'failed'].includes(r.status));
-}
 function fwdEnsurePolling() {
   if (window.__fwdTimer) return;
   window.__fwdTimer = setInterval(() => {
@@ -3548,15 +3542,11 @@ function fwdEnsurePolling() {
   }, 5000);
   fwdLoad();
 }
-/** Ignore out-of-order /status responses so a slow poll cannot overwrite a fresher save. */
-let __fwdLoadSeq = 0;
 async function fwdLoad() {
-  const seq = ++__fwdLoadSeq;
   try {
     const q = new URLSearchParams({ filter: window.__fwdFilter || '', q: window.__fwdQ || '' });
     const res = await api('/api/forwarder/status?' + q, { timeoutMs: 15000 });
     const body = await res.json().catch(() => ({}));
-    if (seq !== __fwdLoadSeq) return;
     if (res.status === 401) { demandHisabLogin(!!body.setup, 'Invoice Forwarder-এর জন্য সাইন-ইন লাগবে।'); return; }
     if (!res.ok) throw new Error(body.error || 'Could not load forwarder');
     const first = !window.__fwd;
@@ -3567,10 +3557,8 @@ async function fwdLoad() {
       const live = $('#fwdLive');
       if (live) live.innerHTML = fwdLiveHtml(body);
       fwdPaintButtons(body);
-      fwdPaintSettings(body);
     }
   } catch (err) {
-    if (seq !== __fwdLoadSeq) return;
     const live = $('#fwdLive');
     if (live && !live.querySelector('.fwd-loaderr')) live.insertAdjacentHTML('afterbegin', `<div class="card err fwd-loaderr">${esc(err.message)}</div>`);
   }
@@ -3582,36 +3570,19 @@ function fwdPaintButtons(st) {
   if (tog) { tog.textContent = st.settings.enabled ? 'Stop automation' : 'Start automation'; tog.className = 'btn ' + (st.settings.enabled ? 'danger' : 'primary'); }
   document.querySelector('.fwd-switch')?.classList.toggle('on', st.settings.enabled);
 }
-/** Keep Settings inputs aligned with server — skip fields the user is actively editing. */
-function fwdPaintSettings(st) {
-  const form = document.querySelector('[data-fwd-form="cfg"]');
-  const s = st?.settings;
-  if (!form || !s) return;
-  const url = form.querySelector('[name="apiUrl"]');
-  if (url && document.activeElement !== url) url.value = s.apiUrl || '';
-  const interval = form.querySelector('[name="intervalMin"]');
-  if (interval && document.activeElement !== interval) interval.value = s.intervalMin;
-  const src = new Set(Array.isArray(s.sourceStatuses) && s.sourceStatuses.length ? s.sourceStatuses : ['PENDING']);
-  form.querySelectorAll('[name="sourceStatuses"]').forEach(cb => {
-    if (document.activeElement === cb) return;
-    cb.checked = src.has(cb.value);
-  });
-}
 function fwdLiveHtml(st) {
   const k = st.stats, c = st.connection, s = st.settings, lr = st.lastRun;
   const tile = (label, v, cls = '', hint = '') => `<div class="fwd-tile ${cls}"><span>${label}</span><b>${v}</b>${hint ? `<small>${hint}</small>` : ''}</div>`;
-  const filters = [['', 'All'], ['received', 'Received'], ['not_received', 'Not received'], ['error', 'Error'], ['queued', 'Queued']];
+  const filters = [['', 'All'], ['matched', 'Matched'], ['not_matched', 'Not matched'], ['error', 'Error'], ['queued', 'Queued']];
   const f = window.__fwdFilter || '';
+  const pill = r => { const [label, tone] = FWD_STATUS[r.status] || [r.status, '']; return `<span class="fwd-pill ${tone}">${esc(label)}</span>`; };
   const sentBits = lr ? Object.entries(lr.sent || {}).map(([x, n]) => ` · ${n} ${esc(((FWD_STATUS[x] || [x])[0]).toLowerCase())}`).join('') : '';
   const srcLabel = (Array.isArray(s.sourceStatuses) && s.sourceStatuses.length ? s.sourceStatuses : ['PENDING'])
     .map(x => ({ PENDING: 'Pending', SHIPPED: 'Shipped', RTS: 'RTS' }[x] || x)).join(' + ');
   const lastRunText = lr
     ? `${dt(lr.finished || lr.started)} · ${lr.fetched} orders (${esc(srcLabel)}) · ${lr.newIds} new${sentBits}${lr.error ? ` · <b class="neg">${esc(lr.error)}</b>` : ''}`
     : 'Never';
-  const done = r => fwdIsReceived(r);
-  const notRecvN = k.notReceived ?? k.notMatched ?? 0;
-  const recvN = k.received ?? k.matched ?? 0;
-  const sentN = k.sent ?? 0;
+  const done = r => ['forwarded', 'exists'].includes(r.status);
   const STAGE_META = {
     PENDING: { label: 'Pending', tone: 'pending' },
     SHIPPED: { label: 'Shipped', tone: 'ok' },
@@ -3630,37 +3601,18 @@ function fwdLiveHtml(st) {
     }).join('');
     return `<td class="fwd-ecom">${bits}</td>`;
   };
-  const sentCell = r => {
-    if (!fwdIsSent(r)) return `<td><span class="fwd-pill pending">Not sent</span></td>`;
-    const when = r.sent_at || r.last_attempt_at;
-    return `<td><span class="fwd-pill ok">Sent</span>${when ? `<small class="muted">${dt(when)}</small>` : ''}${r.last_http != null ? `<small class="muted">HTTP ${esc(String(r.last_http))}</small>` : ''}</td>`;
-  };
-  const recvCell = r => {
-    if (r.status === 'new' || r.status === 'sending') {
-      return `<td><span class="fwd-pill pending">${r.status === 'sending' ? 'Sending…' : '—'}</span></td>`;
-    }
-    if (fwdIsReceived(r)) {
-      return `<td><span class="fwd-pill ok">Received</span>${r.forwarded_at ? `<small class="muted">${dt(r.forwarded_at)}</small>` : ''}</td>`;
-    }
-    if (fwdIsSent(r) || r.status === 'failed' || r.status === 'invalid' || r.status === 'no_match') {
-      const tip = r.last_message ? esc(String(r.last_message).slice(0, 120)) : 'Remote did not accept';
-      return `<td><span class="fwd-pill ${r.status === 'failed' || r.status === 'invalid' ? 'fail' : 'warn'}" title="${tip}">Not received</span></td>`;
-    }
-    return `<td><span class="muted">—</span></td>`;
-  };
   const trackBtn = r => {
     const shipped = String(r.ecom_status || '').toUpperCase() === 'SHIPPED' || /steadfast|packzy/i.test(String(r.courier || ''));
     if (!shipped && !r.courier_status) return '';
     return `<button class="btn sm" data-click="fwdTracking" data-id="${esc(r.invoice_id)}">Tracking</button>`;
   };
-  const canRetry = r => !fwdIsReceived(r) && ['failed', 'no_match', 'invalid'].includes(r.status);
   const rows = st.rows.map(r => `<tr>
       <td><b>${esc(r.invoice_id)}</b></td><td>${esc(r.phone)}</td><td>${esc(r.name)}</td><td>${esc(r.courier)}</td>
-      <td class="n">৳${Number(r.cod_amount || 0).toLocaleString('en-IN')}</td>${ecomCell(r)}${sentCell(r)}${recvCell(r)}
+      <td class="n">৳${Number(r.cod_amount || 0).toLocaleString('en-IN')}</td>${ecomCell(r)}<td>${pill(r)}</td>
       <td class="fwd-courier-status">${r.courier_status ? esc(r.courier_status) : '<span class="muted">—</span>'}</td>
       <td class="n">${r.attempts}</td>
       <td>${r.last_attempt_at ? dt(r.last_attempt_at) : '<span class="muted">—</span>'}${r.next_retry_at && !done(r) ? `<small class="muted">retry ${dt(r.next_retry_at)}</small>` : ''}</td>
-      <td class="fwd-row-btns">${r.attempts ? `<button class="btn sm" data-click="fwdLog" data-id="${esc(r.invoice_id)}">Request</button>` : `<button class="btn sm" data-click="fwdPreview" data-id="${esc(r.invoice_id)}">Preview</button>`}${trackBtn(r)}${canRetry(r) ? `<button class="btn sm" data-click="fwdRetryOne" data-id="${esc(r.invoice_id)}">Retry</button>` : ''}</td>
+      <td class="fwd-row-btns">${r.attempts ? `<button class="btn sm" data-click="fwdLog" data-id="${esc(r.invoice_id)}">Request</button>` : `<button class="btn sm" data-click="fwdPreview" data-id="${esc(r.invoice_id)}">Preview</button>`}${trackBtn(r)}${['failed', 'no_match', 'invalid'].includes(r.status) ? `<button class="btn sm" data-click="fwdRetryOne" data-id="${esc(r.invoice_id)}">Retry</button>` : ''}</td>
     </tr>`).join('');
   return `<div class="fwd-status">
       <span class="fwd-dot ${esc(c.state)}"></span><b>${esc(c.text)}</b>
@@ -3668,31 +3620,30 @@ function fwdLiveHtml(st) {
     </div>
     <p class="muted fwd-lastrun">Last run: ${lastRunText}</p>
     <div class="fwd-main">
-      ${tile('Sent', sentN, '', 'PackKoro-তে POST হয়েছে')}
-      ${tile('Received', recvN, 'ok', 'Remote গ্রহণ করেছে (HTTP 2xx)')}
-      ${tile('Not received', notRecvN, 'warn', 'পাঠানো হয়েছে কিন্তু গ্রহণ হয়নি · Retry দিন')}
-      ${tile('Error', k.errors, 'fail', 'সার্ভার ত্রুটি বা reject')}
+      ${tile('Matched', k.matched, 'ok', 'PackKoro অর্ডারে invoice বসেছে')}
+      ${tile('Not matched', k.notMatched, 'warn', 'ওই ফোনে অর্ডার নেই · নিজে Retry দিন')}
+      ${tile('Error', k.errors, 'fail', 'সার্ভার ত্রুটি বা গ্রহণ করেনি')}
     </div>
     <div class="fwd-tiles">
       ${tile('Queued', k.queued, 'pending', 'পাঠানোর অপেক্ষায়')}
       ${tile('Unique invoice IDs', k.uniqueInvoices)}
       ${tile('Orders discovered', k.ordersDiscovered, '', 'all scans, total')}
-      ${tile('Already received (skipped)', k.duplicatesSkipped, '', 'আগেই received — আবার পাঠানো হয়নি')}
+      ${tile('Duplicates skipped', k.duplicatesSkipped, '', 'আগেই matched, আবার পাঠানো হয়নি')}
       ${tile('Last sync', k.lastSyncAt ? dt(k.lastSyncAt) : '—', 'date')}
-      ${tile('Last received', k.lastSuccessAt ? dt(k.lastSuccessAt) : '—', 'date')}
+      ${tile('Last match', k.lastSuccessAt ? dt(k.lastSuccessAt) : '—', 'date')}
     </div>
     <div class="card">
       <div class="fwd-bar">
         <div class="fwd-filters">${filters.map(([v, l]) => `<button class="btn sm ${f === v ? 'on' : ''}" data-click="fwdFilter" data-f="${v}">${l}</button>`).join('')}</div>
         <div class="fwd-actions">
-          <button class="btn sm" data-click="fwdRetry" data-which="not_received" ${notRecvN ? '' : 'disabled'}>Retry not received (${notRecvN})</button>
+          <button class="btn sm" data-click="fwdRetry" data-which="no_match" ${k.notMatched ? '' : 'disabled'}>Retry not matched (${k.notMatched})</button>
           <button class="btn sm" data-click="fwdRetry" data-which="failed" ${k.errors ? '' : 'disabled'}>Retry errors (${k.errors})</button>
         </div>
       </div>
-      <div class="tw"><table class="fwd-table"><tr><th>Invoice ID</th><th>Phone</th><th>Name</th><th>Courier</th><th class="n">COD</th><th>Ecom</th><th>Sent</th><th>Received</th><th>Courier step</th><th class="n">Tries</th><th>Last attempt</th><th></th></tr>
-      ${rows || '<tr><td colspan="12" class="muted">No invoices yet. Press “Sync now”.</td></tr>'}
+      <div class="tw"><table class="fwd-table"><tr><th>Invoice ID</th><th>Phone</th><th>Name</th><th>Courier</th><th class="n">COD</th><th>Ecom</th><th>Status</th><th>Courier step</th><th class="n">Tries</th><th>Last attempt</th><th></th></tr>
+      ${rows || '<tr><td colspan="11" class="muted">No invoices yet. Press “Sync now”.</td></tr>'}
       </table></div>
-      <p class="muted fwd-stage-legend"><span class="fwd-pill ok">Sent</span> = আমরা POST করেছি · <span class="fwd-pill ok">Received</span> = remote গ্রহণ করেছে (HTTP 2xx) · সফল received আর auto-resend হয় না (Retry চাইলে ম্যানুয়াল) · <span class="fwd-stage sent ok">✓ Shipped</span> = সেই Ecom স্ট্যাটাসে পাঠানো হয়েছে</p>
+      <p class="muted fwd-stage-legend"><span class="fwd-stage sent ok">✓ Shipped</span> = সেই স্ট্যাটাসে পাঠানো হয়েছে · <span class="fwd-stage cur pending">Pending</span> = এখন Ecom-এ আছে, এখনো পাঠানো হয়নি · ধূসর = দেখা যায়নি</p>
     </div>`;
 }
 async function fwdPost(path, body) {
@@ -3714,20 +3665,10 @@ document.addEventListener('submit', async e => {
   };
   if (String(fd.get('apiKey') || '').trim()) patch.apiKey = fd.get('apiKey');
   try {
-    // Capture before any focusout/pendingRender can rebuild the form with a stale URL.
-    const data = await fwdPost('/api/forwarder/settings', patch);
+    await fwdPost('/api/forwarder/settings', patch);
     f.querySelector('[name="apiKey"]').value = '';
     toast('Forwarder settings saved');
-    // Apply save response immediately — never null __fwd (that lets a slow poll win and freeze the old URL in the form).
-    if (data.settings) {
-      if (!window.__fwd) {
-        window.__fwd = { stats: {}, rows: [], connection: { state: 'unknown', text: '' }, running: false, lastRun: null, lastError: '' };
-      }
-      window.__fwd.settings = data.settings;
-      fwdPaintSettings({ settings: data.settings });
-    }
-    // Invalidate in-flight polls, then refresh live tiles from /status.
-    __fwdLoadSeq++;
+    window.__fwd = null;
     await fwdLoad();
   } catch (err) { toast(err.message); }
 }, true);
@@ -3836,7 +3777,7 @@ const VIEWS = {
     const src = new Set(Array.isArray(s.sourceStatuses) && s.sourceStatuses.length ? s.sourceStatuses : ['PENDING']);
     const srcBox = (val, label) => `<label class="fwd-src"><input type="checkbox" name="sourceStatuses" value="${val}" ${src.has(val) ? 'checked' : ''}> ${label}</label>`;
     return `<div class="fwd-switch ${s.enabled ? 'on' : ''}">
-        <div><h3>Ecom Drive → PackKoro</h3><p class="muted">সিলেক্ট করা Ecom Drive স্ট্যাটাস (Pending / Shipped / RTS) থেকে <b>সব</b> eligible invoice PackKoro-তে পাঠায় (match-only নয়)। UI-তে দেখাবে Sent (আমরা পাঠিয়েছি) আর Received (remote গ্রহণ করেছে)। একবার Received হলে আর auto-resend হয় না — Retry চাইলে ম্যানুয়াল।</p></div>
+        <div><h3>Ecom Drive → PackKoro</h3><p class="muted">সিলেক্ট করা Ecom Drive স্ট্যাটাস (Pending / Shipped / RTS) থেকে invoice ID নিয়ে PackKoro Invoice API-তে পাঠায়। একবার সফল হলে সেই invoice আর কখনো পাঠানো হয় না।</p></div>
         <div class="fwd-actions">
           <button class="btn ${s.enabled ? 'danger' : 'primary'}" data-click="fwdToggle">${s.enabled ? 'Stop automation' : 'Start automation'}</button>
           <button class="btn" data-click="fwdSync" ${st.running ? 'disabled' : ''}>${st.running ? 'Syncing…' : 'Sync now'}</button>
