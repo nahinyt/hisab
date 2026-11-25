@@ -1,9 +1,14 @@
 // Ecom Drive orders (Pending / Shipped / RTS — selectable) → PackKoro Ecom Drive Invoice API.
 //
+// Send-all: every eligible invoice pulled from Ecom Drive is POSTed. PackKoro phone-match counts
+// are informational only — they no longer gate success. Outcome is Sent (we POSTed) + Received
+// (remote accepted: HTTP 2xx / explicit ack). Successfully received rows are not re-sent unless
+// the user forces Retry (or the invoice moves to a new Ecom Drive stage never sent before).
+//
 // Every invoice ID is one row in SQLite (PRIMARY KEY = invoice_id). Before a send, the row is
 // claimed with a single UPDATE that only succeeds from a sendable state; a row that reached
-// 'forwarded' or 'exists' can never be claimed again, so it is never sent twice — across
-// rescans, page refreshes, restarts and overlapping runs.
+// 'forwarded' or 'exists' (received=1) can never be claimed again — across rescans, refreshes,
+// restarts and overlapping runs.
 //
 // Per-status sending: an invoice is sent at most ONCE per Ecom Drive status (PENDING, SHIPPED, RTS).
 // sent_stages records the statuses already sent. When a finished invoice shows up under a status it was
@@ -11,10 +16,11 @@
 // richer payload. The claim refuses a status that is already in sent_stages, so a status is never sent twice.
 //
 // Destination contract — PackKoro /api/ecomdrive/invoice (Authorization: Bearer <key>):
-//   200 + matched_orders > 0 → forwarded (done)    200 + duplicate/already_assigned_to → exists (done)
-//   200 + matched_orders = 0 → no_match ("Not matched"; never retried automatically, only by manual Retry)
-//   409 → exists, 404 → no_match (generic APIs)    401/403/503 → failed, run stops, backoff retry
-//   429/408/5xx/network/timeout → failed (backoff)  400/413/415/422 → failed (rejected; manual retry)
+//   200 (any body except success:false) → forwarded / received=1  (matched_orders is logged only)
+//   200 + duplicate/already_assigned_to → exists / received=1
+//   409 → exists / received=1            404 → no_match / received=0 (legacy label; not auto-retried)
+//   401/403/503 → failed, run stops, backoff    429/408/5xx/network → failed (backoff)
+//   400/413/415/422 → failed (rejected; manual retry)
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -33,8 +39,9 @@ const STALE_SENDING_MS = 10 * 60000;
 // at most MAX_PER_RUN per sync; the rest wait for the next sync in the same order.
 const SEND_GAP_MS = Number(process.env.FORWARDER_SEND_GAP_MS ?? 1100);
 const MAX_PER_RUN = Math.max(1, Number(process.env.FORWARDER_MAX_PER_RUN ?? 200) || 200);
-// PackKoro URL + Bearer key live in SQLite (Invoice Forwarder UI). Env is a silent last-resort
-// only when the kv row was never written — do not put real keys in .env for normal use.
+// PackKoro URL + Bearer key live in SQLite (Invoice Forwarder UI).
+// Env is a one-time bootstrap only when the kv row is absent — once the user saves, SQLite always wins
+// (even if FORWARDER_API_URL / PACKKORO_* is still set in the process environment).
 const ENV_API_URL = String(process.env.FORWARDER_API_URL || process.env.PACKKORO_INVOICE_URL || '').trim();
 const ENV_API_KEY = String(process.env.FORWARDER_API_KEY || process.env.PACKKORO_API_KEY || '').trim();
 
@@ -103,9 +110,23 @@ export function openForwarder(file) {
     // Per-status sending: ",PENDING,RTS," = already sent for those Ecom Drive statuses.
     'sent_stages TEXT NOT NULL DEFAULT \'\'',
     'stage TEXT NOT NULL DEFAULT \'\'',   // the status the current queue entry / last outcome is for
-    'queued_at TEXT'                       // serial order of the send queue
+    'queued_at TEXT',                      // serial order of the send queue
+    // Delivery tracking: sent_at = last completed POST; received 1/0/NULL = acked / rejected / never tried.
+    'sent_at TEXT',
+    'received INTEGER'
   ]) {
     try { db.exec('ALTER TABLE invoices ADD COLUMN ' + col); } catch { /* already there */ }
+  }
+  if (!db.prepare("SELECT v FROM kv WHERE k = 'sent_received_migrated'").get()) {
+    db.exec(`
+      UPDATE invoices SET sent_at = COALESCE(last_attempt_at, forwarded_at)
+        WHERE attempts > 0 AND sent_at IS NULL;
+      UPDATE invoices SET received = 1
+        WHERE status IN ('forwarded','exists') AND (received IS NULL OR received = 0);
+      UPDATE invoices SET received = 0
+        WHERE status IN ('no_match','failed','invalid') AND attempts > 0 AND received IS NULL;
+      INSERT INTO kv (k, v) VALUES ('sent_received_migrated', '1') ON CONFLICT(k) DO NOTHING;
+    `);
   }
   if (!db.prepare("SELECT v FROM kv WHERE k = 'stages_migrated'").get()) {
     // Rows sent before per-status sending existed: we can't tell which status they went out as,
@@ -157,6 +178,7 @@ function kvOrMissing(k) {
   return row ? { missing: false, v: row.v ?? '' } : { missing: true, v: '' };
 }
 
+/** Prefer SQLite whenever the key exists — never let env override a saved (even empty) value. */
 function resolveSecret(k, envFallback) {
   const row = kvOrMissing(k);
   if (!row.missing) return String(row.v || '').trim();
@@ -432,6 +454,7 @@ function upsertSeen(order, at) {
     // Moved to a status it was never sent for (Pending → Shipped / RTS): one new send, at the back of the queue.
     d().prepare(`UPDATE invoices SET phone = ?, name = ?, address = ?, cod_amount = ?, courier = ?, ecom_status = ?, stage = ?,
         last_seen_at = ?, seen_count = seen_count + 1, queued_at = ?, attempts = 0, next_retry_at = NULL, last_http = NULL,
+        received = NULL, sent_at = NULL,
         status = CASE WHEN ? != '' THEN 'invalid' ELSE 'new' END,
         last_message = CASE WHEN ? != '' THEN ? ELSE ? END
       WHERE invoice_id = ? AND status IN ('forwarded','exists','no_match')`)
@@ -576,10 +599,11 @@ export async function getCourierTracking(invoiceId, { live = true } = {}) {
 
 // ---------- sending ----------
 function claim(invoiceId, at) {
-  // Only one caller can move a row into 'sending'; finished rows can never be claimed.
+  // Only one caller can move a row into 'sending'; received/finished rows can never be claimed.
   // A row is also never claimed for a status (stage) it was already sent for.
   const r = d().prepare(`UPDATE invoices SET status = 'sending', claimed_at = ?
     WHERE invoice_id = ? AND status IN ('new','failed','no_match')
+      AND (received IS NULL OR received = 0)
       AND instr(sent_stages, ',' || COALESCE(NULLIF(ecom_status, ''), 'PENDING') || ',') = 0`).run(at, invoiceId);
   return r.changes === 1;
 }
@@ -590,33 +614,44 @@ function scrub(text, key) {
   return t.replace(/(bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[redacted]');
 }
 
-/** PackKoro reports the outcome in the body of a 200, not only in the status code. */
+/**
+ * Classify destination response.
+ * Send-all: HTTP 2xx (except explicit success:false) ⇒ received. matched_orders is logged only —
+ * zero matches no longer block acceptance.
+ */
 export function classify(status, text = '') {
   let j = null;
   try { j = text ? JSON.parse(text) : null; } catch { j = null; }
   const msg = j && typeof j.message === 'string' ? j.message : '';
   if (status >= 200 && status < 300) {
-    if (j?.success === false) return { state: 'failed', why: msg || 'Destination said success: false', transient: false, rejected: true };
+    if (j?.success === false) {
+      return { state: 'failed', why: msg || 'Destination said success: false', transient: false, rejected: true, received: false };
+    }
     if (j?.duplicate === true || j?.already_assigned_to) {
-      return { state: 'exists', why: 'Already assigned on PackKoro' + (j.already_assigned_to ? ' (' + (j.already_assigned_to.pk_id || JSON.stringify(j.already_assigned_to)) + ')' : '') };
+      return {
+        state: 'exists',
+        why: 'Already assigned on PackKoro' + (j.already_assigned_to ? ' (' + (j.already_assigned_to.pk_id || JSON.stringify(j.already_assigned_to)) + ')' : ''),
+        received: true
+      };
     }
     if (j && 'matched_orders' in j) {
       const n = Number(j.matched_orders) || 0;
       const pk = Array.isArray(j.updated_orders) ? j.updated_orders.map(o => o?.pk_id).filter(Boolean).join(', ') : '';
-      return n > 0
-        ? { state: 'forwarded', why: 'Assigned on PackKoro' + (pk ? ' → ' + pk : '') }
-        : { state: 'no_match', why: msg || 'No eligible order found for this phone number' };
+      const matchNote = n > 0
+        ? 'PackKoro matched ' + n + ' order(s)' + (pk ? ' → ' + pk : '')
+        : (msg || 'Accepted by destination (0 PackKoro phone matches — still received)');
+      return { state: 'forwarded', why: matchNote, received: true };
     }
-    return { state: 'forwarded', why: msg || 'Accepted by destination (HTTP ' + status + ')' };
+    return { state: 'forwarded', why: msg || 'Accepted by destination (HTTP ' + status + ')', received: true };
   }
-  if (status === 409) return { state: 'exists', why: msg || 'Already exists on destination' };
-  if (status === 404) return { state: 'no_match', why: msg || 'Destination found no matching order' };
-  if (status === 401 || status === 403) return { state: 'failed', why: 'API key rejected (HTTP ' + status + ')' + (msg ? ': ' + msg : ''), transient: false };
+  if (status === 409) return { state: 'exists', why: msg || 'Already exists on destination', received: true };
+  if (status === 404) return { state: 'no_match', why: msg || 'Destination returned 404', received: false };
+  if (status === 401 || status === 403) return { state: 'failed', why: 'API key rejected (HTTP ' + status + ')' + (msg ? ': ' + msg : ''), transient: false, received: false };
   // 503 = integration switched off / no key on PackKoro: retrying in the same run is pointless.
-  if (status === 503) return { state: 'failed', why: 'Destination integration is off (HTTP 503)' + (msg ? ': ' + msg : ''), transient: false };
-  if (status === 429) return { state: 'failed', why: 'Rate limited (HTTP 429)', transient: true, wait: 15000 };
-  if (status === 408 || status >= 500) return { state: 'failed', why: 'Destination error (HTTP ' + status + ')' + (msg ? ': ' + msg : ''), transient: true };
-  return { state: 'failed', why: 'Rejected by destination (HTTP ' + status + ')' + (msg ? ': ' + msg : ''), transient: false, rejected: true };
+  if (status === 503) return { state: 'failed', why: 'Destination integration is off (HTTP 503)' + (msg ? ': ' + msg : ''), transient: false, received: false };
+  if (status === 429) return { state: 'failed', why: 'Rate limited (HTTP 429)', transient: true, wait: 15000, received: false };
+  if (status === 408 || status >= 500) return { state: 'failed', why: 'Destination error (HTTP ' + status + ')' + (msg ? ': ' + msg : ''), transient: true, received: false };
+  return { state: 'failed', why: 'Rejected by destination (HTTP ' + status + ')' + (msg ? ': ' + msg : ''), transient: false, rejected: true, received: false };
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -654,7 +689,7 @@ async function sendOne(row, settings) {
   let got = null, cls = null;
   for (let i = 0; i < IN_RUN_TRIES; i++) {
     got = await postOnce(settings.apiUrl, settings.apiKey, body);
-    cls = got.status == null ? { state: 'failed', why: got.text, transient: true } : classify(got.status, got.text);
+    cls = got.status == null ? { state: 'failed', why: got.text, transient: true, received: false } : classify(got.status, got.text);
     d().prepare('INSERT INTO attempts (invoice_id, at, http_status, result, response, request_url, request_body, duration_ms, stage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .run(row.invoice_id, now(), got.status, cls.state, scrub(got.text, settings.apiKey), settings.apiUrl, JSON.stringify(body), got.ms ?? null, stage);
     if (!(cls.state === 'failed' && cls.transient) || i === IN_RUN_TRIES - 1) break;
@@ -664,16 +699,18 @@ async function sendOne(row, settings) {
   const attempts = (d().prepare('SELECT attempts FROM invoices WHERE invoice_id = ?').get(row.invoice_id)?.attempts || 0) + 1;
   const msg = cls.why + (got.text && got.status != null ? ' — ' + scrub(got.text, settings.apiKey).slice(0, 200) : '');
   let next = null;
-  // Not matched: never retried automatically — only the manual Retry button sends it again.
+  // 404 / legacy no_match: never auto-retried — only the manual Retry button sends it again.
   if (cls.state === 'no_match') next = null;
   else if (cls.state === 'failed' && !cls.rejected) next = new Date(Date.now() + backoffMin(attempts) * 60000).toISOString();
-  const doneNow = DONE.has(cls.state) ? 1 : 0;
+  const received = cls.received === true || DONE.has(cls.state) ? 1 : 0;
+  const doneNow = received ? 1 : 0;
   d().prepare(`UPDATE invoices SET status = ?, attempts = ?, last_attempt_at = ?, last_http = ?, last_message = ?, next_retry_at = ?,
+      sent_at = ?, received = ?,
       forwarded_at = CASE WHEN ? = 1 THEN ? ELSE forwarded_at END, claimed_at = NULL, stage = ?,
       sent_stages = CASE WHEN ? = 1 THEN (CASE WHEN sent_stages = '' THEN ',' ELSE sent_stages END) || ? || ',' ELSE sent_stages END
     WHERE invoice_id = ? AND status = 'sending'`)
-    .run(cls.state, attempts, fin, got.status, '[' + stage + '] ' + msg, next, doneNow, fin, stage, doneNow, stage, row.invoice_id);
-  if (DONE.has(cls.state)) kvSet('last_success_at', fin);
+    .run(cls.state, attempts, fin, got.status, '[' + stage + '] ' + msg, next, fin, received, doneNow, fin, stage, doneNow, stage, row.invoice_id);
+  if (doneNow) kvSet('last_success_at', fin);
   return cls.state;
 }
 
@@ -721,8 +758,10 @@ export async function runSync({ trigger = 'auto' } = {}) {
       if (!settings.apiUrl || !settings.apiKey) {
         summary.error = 'Set the API URL and API key to start forwarding';
       } else {
-        // Not-matched rows are never picked up here; a manual Retry moves them back to 'new'.
+        // Not-received (legacy no_match) rows are never picked up here; a manual Retry moves them back to 'new'.
+        // Soft-fail: each invoice POST is independent — one failure continues the rest (except auth/503 stop).
         const due = d().prepare(`SELECT * FROM invoices WHERE status IN ('new','failed')
+            AND (received IS NULL OR received = 0)
             AND (next_retry_at IS NULL OR next_retry_at <= ?) ORDER BY COALESCE(queued_at, first_seen_at), invoice_id LIMIT ?`).all(now(), MAX_PER_RUN);
         let lastSend = 0;
         for (const row of due) {
@@ -751,17 +790,21 @@ export async function runSync({ trigger = 'auto' } = {}) {
   return running;
 }
 
-/** Retry: make failed / no-match rows due now. Never touches finished rows. */
+/** Retry: make failed / not-received rows due now. Never touches successfully received rows. */
 export function retry({ invoiceId, which = 'failed' } = {}) {
   const at = now();
-  // Not matched / invalid go back to the queue ('new'); errors just become due now.
-  const requeue = `next_retry_at = ?, status = CASE WHEN status IN ('no_match','invalid') THEN 'new' ELSE status END`;
+  // Not-received / invalid go back to the queue ('new'); errors just become due now. Clears received so claim can pick them up.
+  const requeue = `next_retry_at = ?, received = 0, status = CASE WHEN status IN ('no_match','invalid') THEN 'new' ELSE status END`;
   if (invoiceId) {
-    return d().prepare(`UPDATE invoices SET ${requeue} WHERE invoice_id = ? AND status IN ('failed','no_match','invalid','new')`).run(at, invoiceId).changes;
+    return d().prepare(`UPDATE invoices SET ${requeue} WHERE invoice_id = ? AND status IN ('failed','no_match','invalid','new') AND (received IS NULL OR received = 0)`).run(at, invoiceId).changes;
+  }
+  if (which === 'not_received') {
+    return d().prepare(`UPDATE invoices SET ${requeue}
+      WHERE status IN ('failed','no_match','invalid') AND (received = 0 OR status = 'no_match')`).run(at).changes;
   }
   const states = which === 'all' ? ['failed', 'invalid', 'no_match']
     : which === 'no_match' ? ['no_match'] : ['failed', 'invalid'];
-  return d().prepare(`UPDATE invoices SET ${requeue} WHERE status IN (${states.map(() => '?').join(',')})`).run(at, ...states).changes;
+  return d().prepare(`UPDATE invoices SET ${requeue} WHERE status IN (${states.map(() => '?').join(',')}) AND (received IS NULL OR received = 0)`).run(at, ...states).changes;
 }
 
 // ---------- scheduler ----------
@@ -779,8 +822,13 @@ export function forwarderStatus({ filter = '', search = '', limit = 200 } = {}) 
   const stats = {
     ordersDiscovered: Number(kvGet('orders_discovered', '0')),
     uniqueInvoices: count('SELECT COUNT(*) n FROM invoices'),
-    matched: count("SELECT COUNT(*) n FROM invoices WHERE status IN ('forwarded','exists')"),
-    notMatched: count("SELECT COUNT(*) n FROM invoices WHERE status = 'no_match'"),
+    // New primary metrics: sent = we POSTed; received = remote accepted (2xx / exists).
+    sent: count('SELECT COUNT(*) n FROM invoices WHERE sent_at IS NOT NULL OR attempts > 0'),
+    received: count("SELECT COUNT(*) n FROM invoices WHERE received = 1 OR status IN ('forwarded','exists')"),
+    notReceived: count("SELECT COUNT(*) n FROM invoices WHERE (received = 0 OR status = 'no_match') AND status NOT IN ('forwarded','exists','new','sending')"),
+    // Legacy aliases (older UI tiles / filters).
+    matched: count("SELECT COUNT(*) n FROM invoices WHERE received = 1 OR status IN ('forwarded','exists')"),
+    notMatched: count("SELECT COUNT(*) n FROM invoices WHERE (received = 0 OR status = 'no_match') AND status NOT IN ('forwarded','exists','new','sending')"),
     errors: count("SELECT COUNT(*) n FROM invoices WHERE status IN ('failed','invalid')"),
     queued: count("SELECT COUNT(*) n FROM invoices WHERE status IN ('new','sending')"),
     failedAttempts: count("SELECT COUNT(*) n FROM attempts WHERE result = 'failed'"),
@@ -790,11 +838,19 @@ export function forwarderStatus({ filter = '', search = '', limit = 200 } = {}) 
   };
   const where = [];
   const args = [];
-  const FILTERS = { matched: "('forwarded','exists')", not_matched: "('no_match')", error: "('failed','invalid')", queued: "('new','sending')" };
-  if (FILTERS[filter]) where.push('status IN ' + FILTERS[filter]);
+  const FILTERS = {
+    received: "received = 1 OR status IN ('forwarded','exists')",
+    not_received: "(received = 0 OR status = 'no_match') AND status NOT IN ('forwarded','exists','new','sending')",
+    matched: "received = 1 OR status IN ('forwarded','exists')",
+    not_matched: "(received = 0 OR status = 'no_match') AND status NOT IN ('forwarded','exists','new','sending')",
+    sent: 'sent_at IS NOT NULL OR attempts > 0',
+    error: "status IN ('failed','invalid')",
+    queued: "status IN ('new','sending')"
+  };
+  if (FILTERS[filter]) where.push('(' + FILTERS[filter] + ')');
   if (search) { where.push('(invoice_id LIKE ? OR phone LIKE ? OR name LIKE ?)'); args.push(`%${search}%`, `%${search}%`, `%${search}%`); }
   const rows = d().prepare(`SELECT invoice_id, phone, name, courier, cod_amount, status, attempts, last_attempt_at, last_http, last_message,
-      first_seen_at, last_seen_at, next_retry_at, forwarded_at, ecom_status, courier_status, courier_tracked_at, stage, sent_stages, queued_at FROM invoices ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+      first_seen_at, last_seen_at, next_retry_at, forwarded_at, sent_at, received, ecom_status, courier_status, courier_tracked_at, stage, sent_stages, queued_at FROM invoices ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
       ORDER BY COALESCE(last_attempt_at, first_seen_at) DESC LIMIT ?`).all(...args, Math.min(500, limit));
   let lastRun = null;
   try { lastRun = JSON.parse(kvGet('last_run') || 'null'); } catch { /* ignore */ }
